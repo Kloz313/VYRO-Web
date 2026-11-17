@@ -102,27 +102,7 @@ function renderInfo(info, url) {
       </section>
       ${subtitleLanguages.length ? `<section class="subtitle-picker"><div class="field-label">لغات الترجمة المتاحة</div><div class="checks">${subtitleOptions}</div></section>` : ''}
       ${playlistOptions}
-      <details class="advanced"><summary>الإعدادات المتقدمة</summary>
-        <div class="section-heading"><p>خيارات إضافية للتحكم في طريقة معالجة الملف وتنزيله.</p></div>
-        <div class="form-grid">
-        <label class="field">عنوان الخادم الوسيط (Proxy)<input id="proxyInput" type="url" placeholder="http://host:port"></label>
-        <label class="field">الحد الأقصى لسرعة التنزيل<input id="rateLimit" placeholder="مثال: 2M"></label>
-        <label class="field">عدد الأجزاء المتزامنة<select id="fragments"><option>2</option><option>4</option><option selected>8</option><option>16</option></select></label>
-        <label class="field">صيغة الملف النهائي<select id="remux"><option value="">تلقائي</option><option>mkv</option><option>mp4</option><option>webm</option><option>mov</option></select></label>
-        <label class="field">صيغة ملفات الترجمة<select id="convertSubs"><option value="">بدون تحويل</option><option>srt</option><option>vtt</option><option>ass</option><option>lrc</option></select></label>
-        <label class="field">المقاطع الزمنية المطلوبة<input id="sections" placeholder="مثال: *10-90,120-180"></label>
-        <label class="field">أرقام عناصر قائمة التشغيل<input id="playlistItems" placeholder="مثال: 1,3,5-8"></label>
-        <label class="field">نمط تسمية الملف<input id="outputTemplate" placeholder="%(title)s [%(id)s].%(ext)s"></label>
-        <label class="field">اسم مخصص للملف<input id="newTitle" maxlength="240" placeholder="استبدال عنوان الملف"></label>
-        <label class="field">أولوية اختيار الصيغ<input id="formatSort" placeholder="مثال: res:1080,codec:h264"></label>
-        <label class="field">فئات المقاطع المستبعدة<input id="sponsorCategories" value="sponsor" placeholder="sponsor,intro,outro"></label>
-        <label class="field">ملف ملفات تعريف الارتباط (Cookies)<input id="cookieFile" type="file" accept=".txt,text/plain"></label>
-        <label class="field">معرّف المتصفح (User-Agent)<input id="userAgent" placeholder="اتركه فارغاً لاستخدام القيمة الافتراضية"></label>
-      </div>
-      <div class="checks"><label><input type="checkbox" id="forceIpv4"> استخدام IPv4 فقط</label><label><input type="checkbox" id="restrictNames"> استخدام أسماء ملفات متوافقة</label><label><input type="checkbox" id="chapters" checked> إضافة الفصول إلى الملف</label><label><input type="checkbox" id="splitChapters"> إنشاء ملف مستقل لكل فصل</label><label><input type="checkbox" id="thumb"> إضافة الصورة المصغرة إلى الملف</label><label><input type="checkbox" id="sponsor"> تجاوز المقاطع المحددة</label><label><input type="checkbox" id="writeThumb"> حفظ الصورة المصغرة منفصلة</label><label><input type="checkbox" id="mergeAudioStreams"> دمج مسارات صوتية متعددة</label><label><input type="checkbox" id="noMtime" checked> الحفاظ على تاريخ الملف الأصلي</label><label><input type="checkbox" id="useAria2c"> استخدام aria2c لتسريع التنزيل</label><label><input type="checkbox" id="downloadArchive"> تجاوز العناصر التي سبق تنزيلها</label></div>
-      <p class="security-note">تنبيه أمني: قد يحتوي ملف Cookies على بيانات جلسة خاصة. لا ترفعه إلا إلى خادم تثق به.</p>
-    </details>
-    <div class="action-row"><button class="primary-btn" id="startDownload">تنزيل الآن ↓</button><button class="subtle-btn" id="copyTitle">نسخ عنوان المحتوى</button></div>
+<div class="action-row"><button class="primary-btn" id="startDownload">تنزيل الآن ↓</button><button class="subtle-btn" id="copyTitle">نسخ عنوان المحتوى</button></div>
     <div id="downloadProgress" class="download-progress hidden" role="status" aria-live="polite">
       <div class="progress-heading"><span id="progressLabel">جارٍ إعداد التنزيل...</span><span id="progressPercent">0%</span></div>
       <div class="bar"><i id="progressBar"></i></div>
@@ -137,16 +117,17 @@ function renderInfo(info, url) {
   $('startDownload').onclick = async () => {
     const button = $('startDownload'); button.disabled = true;
     try {
-      const cookie = $('cookieFile')?.files?.[0];
       const selectedPlaylist = [...root.querySelectorAll('.playlist-entry:checked')].map(x => Number(x.value));
       const playlistEnabled = $('playlist')?.checked || false;
-      let playlistItems = $('playlistItems')?.value.trim() || null;
-      // If every visible item is selected on a truncated playlist, leave the
-      // range empty so yt-dlp downloads the full playlist, not only first 200.
-      if (playlistEnabled && selectedPlaylist.length && selectedPlaylist.length < entries.length) playlistItems = selectedPlaylist.join(',');
-      if (playlistEnabled && entries.length && selectedPlaylist.length === 0 && !playlistItems) throw new Error('حدد عنصراً واحداً على الأقل من قائمة التشغيل.');
+      let playlistItems = null;
+      if (playlistEnabled && selectedPlaylist.length && selectedPlaylist.length < entries.length) {
+        playlistItems = selectedPlaylist.join(',');
+      }
+      if (playlistEnabled && entries.length && selectedPlaylist.length === 0) {
+        throw new Error('حدد عنصراً واحداً على الأقل من قائمة التشغيل.');
+      }
+
       const selectedSubs = [...root.querySelectorAll('.subtitle-language:checked')].map(x => x.value);
-      const cookies_text = cookie ? await cookie.text() : null;
       const audioOnly = $('audioOnly').checked;
       const selectedVideoId = $('formatSelect').value;
       const selectedAudioIds = [...$('audioStreamSelect').selectedOptions].map(option => option.value);
@@ -157,47 +138,56 @@ function renderInfo(info, url) {
       else if (selectedVideoId && selectedVideoFormat?.acodec === 'none') formatId = `${selectedVideoId}+ba/b`;
       else if (selectedVideoId) formatId = selectedVideoId;
       else if (selectedAudioIds.length) formatId = `bv+${selectedAudioIds.join('+')}/b`;
-      else formatId = null;
-      const requestedSort = $('formatSort').value.split(',').map(x => x.trim()).filter(Boolean);
-      if (!audioOnly && !selectedVideoId && !requestedSort.length) {
+
+      const requestedSort = [];
+      if (!audioOnly && !selectedVideoId) {
         const codecPreference = $('videoCodec').value;
         if (codecPreference === 'compatibility') requestedSort.push('proto', 'vcodec:h264', 'ext');
         else if (codecPreference === 'quality') requestedSort.push(preferredVideoCodecSort());
         const resolution = $('videoResolution').value;
         if (resolution) requestedSort.push(`res:${resolution}`);
       }
+
       const response = await api('/api/download', {method: 'POST', body: JSON.stringify({
         url, format_id: formatId,
-        audio_only: audioOnly, audio_format: $('audioFormat').value || null, audio_quality: $('audioQuality').value,
-        playlist: playlistEnabled, playlist_items: playlistItems,
+        audio_only: audioOnly,
+        audio_format: $('audioFormat').value || null,
+        audio_quality: $('audioQuality').value,
+        playlist: playlistEnabled,
+        playlist_items: playlistItems,
         subtitles: $('subs').checked || selectedSubs.length > 0,
-        auto_subtitles: $('autoSubs').checked, auto_translated_subtitles: false,
+        auto_subtitles: $('autoSubs').checked,
+        auto_translated_subtitles: false,
         subtitle_languages: selectedSubs.length ? selectedSubs.join(',') : 'en.*,.*-orig',
-        embed_subtitles: $('embedSubs').checked, keep_subtitle_files: false, embed_thumbnail: $('thumb').checked,
-        sponsorblock: $('sponsor').checked,
-        sponsorblock_categories: $('sponsorCategories').value.split(',').map(x => x.trim()).filter(Boolean),
-        write_thumbnail: $('writeThumb').checked, merge_audio_streams: $('mergeAudioStreams').checked || selectedAudioIds.length > 1 || (!!selectedVideoId && selectedAudioIds.length > 0 && selectedVideoFormat?.acodec !== 'none'),
-        new_title: $('newTitle').value.trim() || null,
+        embed_subtitles: $('embedSubs').checked,
+        keep_subtitle_files: false,
+        embed_metadata: true,
+        embed_chapters: true,
+        concurrent_fragments: 8,
+        merge_audio_streams: selectedAudioIds.length > 1 || (!!selectedVideoId && selectedAudioIds.length > 0 && selectedVideoFormat?.acodec !== 'none'),
         format_sort: requestedSort,
-        proxy_url: $('proxyInput').value.trim() || null,
-        rate_limit: $('rateLimit').value.trim() || null, concurrent_fragments: Number($('fragments').value),
-        cookies_text, force_ipv4: $('forceIpv4').checked, user_agent: $('userAgent').value.trim() || null,
-        use_aria2c: $('useAria2c').checked, use_download_archive: $('downloadArchive').checked,
-        restrict_filenames: $('restrictNames').checked,
-        remux_video: $('remux').value || null, convert_subtitles: $('convertSubs').value || null,
-        download_sections: $('sections').value.split(',').map(x => x.trim()).filter(Boolean),
-        output_template: $('outputTemplate').value.trim() || null,
-        embed_chapters: $('chapters').checked, split_chapters: $('splitChapters').checked,
-        subdirectory_extractor: $('subdirectoryExtractor')?.checked || false,
-        subdirectory_playlist_title: $('subdirectoryPlaylist')?.checked || false,
-        crop_artwork: $('cropArtwork')?.checked || false,
-        no_mtime: $('noMtime').checked, media_title: info.title || null, extractor: info.extractor || null
+        no_mtime: true,
+        media_title: info.title || null,
+        extractor: info.extractor || null
       })});
       toast('بدأت عملية التنزيل'); await monitorJob(response.id, button);
     } catch (error) { toast(error.message); }
     finally { button.disabled = false; }
   };
   $('copyTitle').onclick = () => navigator.clipboard?.writeText(info.title || '').then(() => toast('تم نسخ العنوان'));
+}
+
+async function autoDownloadFiles(files) {
+  for (const file of files) {
+    const link = document.createElement('a');
+    link.href = `/api/files/${encodeURIComponent(file)}`;
+    link.download = file.split('/').pop();
+    link.hidden = true;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
 }
 
 async function monitorJob(jobId, startButton) {
@@ -229,6 +219,8 @@ async function monitorJob(jobId, startButton) {
       $('cancelDownload').classList.add('hidden');
       if (job.files?.length) {
         $('downloadLinks').innerHTML = job.files.map(file => `<a class="primary-btn download-link" href="/api/files/${encodeURIComponent(file)}">تنزيل الملف ${safe(file.split('/').pop())} ↓</a>`).join('');
+        await autoDownloadFiles(job.files);
+        toast('بدأ تنزيل الملفات تلقائياً');
       } else if (job.warning) {
         $('progressError').textContent = job.warning; $('progressError').classList.remove('hidden');
       }
@@ -247,3 +239,60 @@ api('/api/health').then(status => {
   $('engineStatus').textContent = `yt-dlp ${status.engine} · FFmpeg ${status.ffmpeg ? 'متاح' : 'غير متاح'}`;
 }).catch(() => $('engineStatus').textContent = 'محرك التنزيل غير متصل');
 
+
+// VYRO PWA installation
+(() => {
+  const box = $('installPrompt');
+  const installBtn = $('installButton');
+  const laterBtn = $('dismissInstall');
+  if (!box || !installBtn || !laterBtn) return;
+
+  const standalone = window.matchMedia('(display-mode: standalone)').matches ||
+    navigator.standalone === true;
+  const ios = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+  let dismissed = 0;
+  try { dismissed = Number(localStorage.getItem('vyro-install-dismissed') || 0); } catch {}
+  const canShow = !standalone && Date.now() - dismissed > 7 * 86400000;
+  let installEvent = null;
+
+  const show = () => { if (canShow) box.classList.remove('hidden'); };
+  const hide = () => box.classList.add('hidden');
+
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/service-worker.js').catch(() => {});
+    });
+  }
+
+  window.addEventListener('beforeinstallprompt', event => {
+    event.preventDefault();
+    installEvent = event;
+    show();
+  });
+
+  if (ios && canShow) {
+    installBtn.textContent = 'طريقة التثبيت';
+    setTimeout(show, 1800);
+  }
+
+  installBtn.addEventListener('click', async () => {
+    if (installEvent) {
+      const event = installEvent;
+      installEvent = null;
+      hide();
+      await event.prompt();
+      await event.userChoice;
+    } else if (ios) {
+      alert('لتثبيت VYRO على iPhone:\n1. افتح الموقع في Safari.\n2. اضغط زر المشاركة.\n3. اختر إضافة إلى الشاشة الرئيسية.\n4. اضغط إضافة.');
+    }
+  });
+
+  laterBtn.addEventListener('click', () => {
+    try { localStorage.setItem('vyro-install-dismissed', String(Date.now())); } catch {}
+    hide();
+  });
+
+  window.addEventListener('appinstalled', hide);
+})();

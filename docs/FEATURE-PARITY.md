@@ -17,16 +17,16 @@ The complete source-derived inventory is in [`SOURCE-BASELINE.md`](SOURCE-BASELI
 | Thumbnail write/embed | yt-dlp + FFmpeg | Partial; standalone thumbnails use PNG and audio metadata embedding requests JPG artwork; live tests pending |
 | Metadata embedding | yt-dlp postprocessor | Partial |
 | SponsorBlock | yt-dlp SponsorBlock integration | Partial; category UI not complete |
-| Proxy / forced IPv4 / rate limit | Backend yt-dlp options | Partial |
-| Cookie upload | Temporary server-side Netscape cookie file | Partial; temporary file mode restricted, profile management/encryption not implemented |
-| Cookie profiles in Room | Encrypted user-scoped profile storage | Not implemented |
-| User-Agent selection | Per-download HTTP header | Implemented (initial; input validation added) |
+| Proxy / forced IPv4 / rate limit | Not exposed to visitors; server uses automatic defaults | Removed from visitor workflow |
+| Cookie upload | Not requested from visitors; no cookie upload endpoint | Not exposed; normal use requires no visitor session |
+| Cookie profiles in Room | No visitor cookie profiles | Not implemented; visitor login/cookies are not part of the web workflow |
+| User-Agent selection | Automatic engine defaults | Not exposed to visitors |
 | aria2c external downloader | Optional Linux aria2c worker | Implemented (initial; Docker image installs aria2; runtime test pending) |
 | Concurrent fragments | yt-dlp option | Implemented (initial) |
 | Download progress | Inline progress within the analyzed media card | Implemented; polls the individual job, shows progress/speed/ETA, supports cancellation and exposes final file links without a task list |
 | Cancel task | Progress-hook and postprocessor-hook cancellation | Implemented (initial; cancellation is checked during download and between postprocessors; real download tests pending) |
 | Resume after browser refresh | SQLite job snapshots | Implemented (initial); progress and completed-file links survive browser refresh |
-| Durable queue / restart recovery | SQLite-persisted request snapshots + in-process worker recovery | Partial; cookie-free jobs without credential-bearing proxies are requeued after process restart and yt-dlp can continue `.part` files; jobs needing transient cookies or proxy credentials are marked interrupted; no independent/distributed worker service |
+| Durable queue / restart recovery | SQLite-persisted request snapshots + in-process worker recovery | Partial; jobs without visitor-supplied session secrets are persisted and requeued after process restart; no independent/distributed worker service |
 | Download history | Browser native downloads list; no in-app completion/history panel | UI removed and new completion rows are no longer written; legacy SQLite table/API are retained for backward compatibility |
 | Export history as JSON / URL list | API export endpoints | Implemented (initial) |
 | Import backup/history | Validated import workflow | Not implemented |
@@ -56,14 +56,14 @@ The complete source-derived inventory is in [`SOURCE-BASELINE.md`](SOURCE-BASELI
 Compared the Android source (`DownloadUtil.kt`, `Downloader.kt`, `DownloadViewModel.kt`, and `PreferenceUtil.kt`) with the web backend and its API client. The following source-level mismatches were corrected in the web working copy:
 
 - Fixed `/api/jobs`: its persisted-row query now selects the `id` column that the response builder reads.
-- Added restart recovery: request snapshots are persisted without cookie contents or credential-bearing proxy URLs; eligible jobs are requeued on restart and can resume partial downloads, while jobs requiring transient secrets are marked `interrupted` in both the SQLite status column and API snapshot.
+- Added restart recovery: request snapshots are persisted without visitor-supplied session secrets; jobs are requeued on restart and can resume partial downloads.
 - Aligned several Android defaults: 5-second socket timeout, one retry, 8 concurrent fragments, `--no-mtime`, chapter embedding for normal video downloads, subtitle language pattern `en.*,.*-orig`, and the Android 200-byte title output template.
 - Audio-only now keeps the source audio format unless conversion is explicitly selected; audio bitrate preference maps to Android's `abr~192`, `abr~128`, `abr~64`, and `abr~32` sorting behavior. Audio-only requests no longer inherit video chapter/subtitle embedding behavior.
 - Expanded format-sort validation to accept Android's `vcodec`, `acodec`, and `abr~` sort fields. Browser codec capability now supplies a default codec preference when the user has not explicitly selected a format.
-- Corrected the yt-dlp embedded-Python option mapping: FFmpeg extraction, remuxing, metadata, chapters, thumbnail conversion/embedding, subtitle conversion/embedding, SponsorBlock, metadata parsing, and chapter splitting are now configured as explicit postprocessors; time clips use the Python `download_ranges` callback; IPv4 and rate limits use Python-API values. A nonzero yt-dlp return code now fails the job instead of being reported as completed.
+- Corrected the yt-dlp embedded-Python option mapping: FFmpeg extraction, remuxing, metadata, chapters, thumbnail conversion/embedding, subtitle conversion/embedding, SponsorBlock, metadata parsing, and chapter splitting are now configured as explicit postprocessors; time clips use the Python `download_ranges` callback; platform-specific request settings use Python-API values. A nonzero yt-dlp return code now fails the job instead of being reported as completed.
 - Normalized time-based download sections to yt-dlp's `*start-end` syntax and Android-style timestamped filenames.
 - Added chapter-specific output templates for split chapters, optional extractor and playlist subdirectories, separate Audio/Video output folders, audio album/date/track metadata parsing, and optional square audio-artwork cropping.
-- File delivery now safely supports nested output paths; user-supplied proxy hosts are also checked against local/private network targets.
+- File delivery now safely supports nested output paths.
 - Aligned thumbnail conversion, audio artwork embedding, default YouTube translated-caption exclusion, and MKV remuxing when embedding subtitles in video.
 - Prevented temporary pre-merge filenames from being recorded as the final downloaded file when a postprocessor reports the final path; cancellation is also checked between postprocessors.
 
@@ -71,9 +71,9 @@ The combined release pass also adds Android-style preferred video codec/resoluti
 
 ### Remaining functional differences from Android
 
-- Android can read cookies from its built-in WebView; the web service requires a user-supplied Netscape cookie file and does not provide encrypted reusable cookie profiles.
+- Android can optionally read cookies from its built-in WebView; the web version deliberately does not ask visitors for cookies or login details.
 - Android stores audio/video in device-selected directories and can use private/SD-card locations; web downloads are stored on the server and delivered through browser file downloads.
-- Android's foreground service can continue work independently of the visible screen. Web jobs run in the server worker; eligible cookie-free jobs are requeued after a process restart, while jobs that depend on transient uploaded cookies or proxy credentials are marked interrupted. This is not yet an independent/distributed worker service.
+- Android's foreground service can continue work independently of the visible screen. Web jobs run in the server worker pool and are requeued after a process restart; this is not yet an independent/distributed worker service.
 - Android has device-specific AV1/VP9 support checks; the web edition uses browser codec capability as a substitute, which is not identical to Android hardware codec detection.
 - Playlist discovery remains capped to the first 200 entries in the browser picker.
 - Real chapter-splitting/FFmpeg behavior and archive duplicate messaging still need runtime validation. The web copy now maps chapter-specific output templates, optional extractor/playlist folders, separate Audio/Video output directories, audio date/album/track metadata, and optional square artwork cropping.
@@ -81,22 +81,22 @@ The combined release pass also adds Android-style preferred video codec/resoluti
 
 ## Current core-focused milestone
 
-The interface has been narrowed around the primary workflow: paste URL, analyze media, choose a format/quality, optionally select audio/subtitles/playlist items, start the download, and monitor the current job inline. The task-list and history panels are not shown; completed files are offered directly from the same progress area and the browser provides its own downloads history. Non-download Android settings and app-only screens are not being ported. Download-related options retained include cookies, proxy, User-Agent, rate limit, IPv4, aria2c, archive, playlist item ranges, clips, subtitle conversion/embedding, chapters, thumbnail and metadata processing.
+The interface has been narrowed around the primary workflow: paste URL, analyze media, choose a format/quality, optionally select audio/subtitles/playlist items, start the download, and monitor the current job inline. The task-list and history panels are not shown; completed files are offered directly from the same progress area and the browser provides its own downloads history. Non-download Android settings and app-only screens are not being ported. Advanced connection and session controls have been removed from the visitor interface. The visible workflow retains media quality, audio format/quality, subtitles and playlist selection.
 
 The playlist picker exposes up to 200 entries to avoid unbounded response/UI growth; users can still specify yt-dlp playlist ranges for larger playlists.
 
 ## Critical production blockers
 
-1. **Authentication and user isolation:** Docker now enables a shared HTTP Basic-Auth gate, but there are no individual user accounts, per-user job/file isolation or per-user quotas. Treat it as a private single-operator deployment, not a public multi-user service.
+1. **Open public access:** No visitor login, subscription, per-IP request quota, or per-user download quota is enabled, by design. Public use still depends on the hosting plan's finite CPU, memory, storage and network capacity.
 2. **SSRF/redirect safety:** initial URL checks reject obvious private destinations, but extractor redirects and nested requests need network-level egress restrictions. URL validation alone is not a complete SSRF defense.
-3. **Durable workers:** SQLite can requeue eligible cookie-free tasks after restart, but execution is still in-process. There is no independent worker service, distributed locking, multi-instance coordination, or guaranteed recovery for jobs requiring transient cookies/proxy credentials.
-4. **Storage lifecycle:** persistence volume, per-user storage quota, retention, cleanup, file access control and download expiration must be implemented.
-5. **Cookie protection:** uploaded cookies are temporarily written with restrictive file permissions and deleted after the request, but reusable encrypted cookie profiles and account-scoped secrets are not implemented.
-6. **Abuse controls:** basic per-IP request throttling and a concurrent-job cap are implemented. File-size/time limits, persistent distributed rate limits, audit logs and abuse handling are still required for public use.
-7. **Platform testing:** yt-dlp/FFmpeg/aria2c must be tested on the actual Linux amd64 runtime. This execution environment has no network access and does not have yt-dlp installed; FFmpeg is present locally, but aria2c and Docker are unavailable. No real extractor/download or full media-processing test has been performed. The 28 automated tests are API/unit tests using a deliberately mocked yt-dlp engine; they validate API plumbing, option mapping, job snapshots, progress/cancellation hooks and filename handling, but do not prove live extractor behavior.
+3. **Durable workers:** SQLite can requeue tasks after restart, but execution is still in-process. There is no independent worker service, distributed locking, or multi-instance coordination.
+4. **Storage lifecycle:** persistence volume, storage retention, cleanup and download expiration must be configured for the chosen hosting plan.
+5. **Visitor sessions:** visitor cookie uploads and account sessions are intentionally not part of the web workflow.
+6. **Resource protection:** there are no per-IP request throttles or per-user job caps. Network egress restrictions and host-level capacity monitoring remain important to protect the public service.
+7. **Platform testing:** yt-dlp/FFmpeg/aria2c must be tested on the actual Linux amd64 runtime. This execution environment has no network access and does not have yt-dlp installed; FFmpeg is present locally, but aria2c and Docker are unavailable. No real extractor/download or full media-processing test has been performed. The 26 automated tests are API/unit tests using a deliberately mocked yt-dlp engine; they validate API plumbing, option mapping, job snapshots, progress/cancellation hooks and filename handling, but do not prove live extractor behavior.
 8. **Blitz.cloud:** the Dockerfile is prepared for a Linux amd64 container and `$PORT` (default 8080), but deployment, persistent volume behavior, runtime limits and plan suitability remain unverified.
 9. **Legal/platform restrictions:** users must only download media they are authorized to download and must comply with each source platform's terms and applicable law.
 
 ## Release gate
 
-Do not label this project complete or production-ready until every source feature is marked with a tested outcome, all remaining exclusions are documented, multi-user authentication and isolation exist if public access is intended, workers and storage are durable, and a real deployment regression suite passes for representative extractors, playlists, formats, subtitles, cookies, proxies, clips, chapter processing, cancellation, recovery and history import/export.
+Do not label this project complete or production-ready until every source feature is marked with a tested outcome, all remaining exclusions are documented, public access is protected against internal-network redirects and workers/storage are durable, and a real deployment regression suite passes for representative extractors, playlists, formats, subtitles, clips, chapter processing, cancellation and recovery.

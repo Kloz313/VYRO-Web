@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import ipaddress
-import base64
-import secrets
 import json
 import os
 import sqlite3
@@ -17,8 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -56,9 +53,7 @@ def init_db() -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, title TEXT, source_url TEXT,
             extractor TEXT, filename TEXT NOT NULL, completed_at REAL NOT NULL
         )""")
-        # Recover eligible jobs from their persisted request snapshot. Jobs
-        # that depended on transient cookies or proxy credentials are marked
-        # interrupted because those secrets are deliberately never persisted.
+        # Recover queued and interrupted work from its persisted request snapshot.
         active_rows = conn.execute(
             "SELECT id, data FROM jobs WHERE status IN ('queued','downloading','processing','cancelling')"
         ).fetchall()
@@ -79,7 +74,7 @@ def init_db() -> None:
             else:
                 snapshot.update({
                     "status": "interrupted",
-                    "error": "توقف التنزيل بعد إعادة تشغيل الخادم؛ تعذرت استعادته لأن بيانات الجلسة المؤقتة غير محفوظة.",
+                    "error": "توقف التنزيل بعد إعادة تشغيل الخادم وتعذرت استعادة المهمة تلقائياً.",
                     "interrupted_at": now,
                 })
                 new_status = "interrupted"
@@ -89,60 +84,11 @@ def init_db() -> None:
             )
 
 init_db()
-# Remove cookie uploads left behind if the process was killed mid-request.
-for stale_cookie in DATA_DIR.glob("cookies-*.txt"):
-    try:
-        if time.time() - stale_cookie.stat().st_mtime > 6 * 60 * 60:
-            stale_cookie.unlink(missing_ok=True)
-    except OSError:
-        pass
-
 app = FastAPI(title="VYRO Web API", version="0.3.0", description="Web edition of VYRO Downloader")
 
-# A single shared Basic-Auth gate is the minimum safe deployment barrier for
-# this single-instance web edition. Use HTTPS at the reverse proxy.
-REQUIRE_AUTH = os.getenv("VYRO_REQUIRE_AUTH", "0").lower() in {"1", "true", "yes"}
-ACCESS_USERNAME = os.getenv("VYRO_ACCESS_USERNAME", "")
-ACCESS_PASSWORD = os.getenv("VYRO_ACCESS_PASSWORD", "")
-if REQUIRE_AUTH and (not ACCESS_USERNAME or not ACCESS_PASSWORD):
-    raise RuntimeError("VYRO_REQUIRE_AUTH is enabled but VYRO_ACCESS_USERNAME/PASSWORD are missing")
-
-_request_buckets: dict[str, list[float]] = {}
-_request_buckets_lock = threading.Lock()
-RATE_LIMIT_PER_MINUTE = max(1, int(os.getenv("VYRO_API_RATE_PER_MINUTE", "30")))
-MAX_ACTIVE_JOBS = max(1, int(os.getenv("VYRO_MAX_ACTIVE_JOBS", "2")))
-
-@app.middleware("http")
-async def access_and_rate_limit(request: Request, call_next):
-    if REQUIRE_AUTH:
-        if request.url.path != "/api/health":
-            header = request.headers.get("authorization", "")
-            try:
-                scheme, encoded = header.split(" ", 1)
-                decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
-                username, password = decoded.split(":", 1)
-            except Exception:
-                username = password = ""
-                scheme = ""
-            if (scheme.lower() != "basic" or
-                not secrets.compare_digest(username, ACCESS_USERNAME) or
-                not secrets.compare_digest(password, ACCESS_PASSWORD)):
-                return JSONResponse({"detail": "المصادقة مطلوبة"}, status_code=401,
-                                    headers={"WWW-Authenticate": 'Basic realm="VYRO Web"'})
-    if request.url.path in {"/api/extract", "/api/download"}:
-        client_ip = request.client.host if request.client else "unknown"
-        now = time.time()
-        with _request_buckets_lock:
-            recent = [t for t in _request_buckets.get(client_ip, []) if now - t < 60]
-            if len(recent) >= RATE_LIMIT_PER_MINUTE:
-                return JSONResponse({"detail": "تجاوزت الحد المؤقت للطلبات، حاول بعد قليل"}, status_code=429)
-            recent.append(now)
-            _request_buckets[client_ip] = recent
-            if len(_request_buckets) > 2048:
-                for key in list(_request_buckets)[:512]:
-                    _request_buckets.pop(key, None)
-    return await call_next(request)
-executor = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("VYRO_DOWNLOAD_WORKERS", "2"))))
+# Public service: no account gate, per-IP request quota, or per-user download quota.
+# Requests enter the worker queue; throughput is bounded only by host resources.
+executor = ThreadPoolExecutor()
 jobs: dict[str, dict[str, Any]] = {}
 jobs_lock = threading.RLock()
 cancel_events: dict[str, threading.Event] = {}
@@ -151,9 +97,6 @@ cancel_events: dict[str, threading.Event] = {}
 class ExtractRequest(BaseModel):
     url: str = Field(min_length=8, max_length=4096)
     include_playlist: bool = False
-    cookies_text: str | None = Field(default=None, max_length=2_000_000)
-    proxy_url: str | None = None
-    force_ipv4: bool = False
 
 
 class DownloadRequest(BaseModel):
@@ -180,12 +123,7 @@ class DownloadRequest(BaseModel):
     new_title: str | None = Field(default=None, max_length=240)
     playlist: bool = False
     restrict_filenames: bool = False
-    rate_limit: str | None = None
     concurrent_fragments: int = Field(default=8, ge=1, le=16)
-    proxy_url: str | None = None
-    cookies_text: str | None = Field(default=None, max_length=2_000_000)
-    force_ipv4: bool = False
-    user_agent: str | None = Field(default=None, max_length=512)
     use_aria2c: bool = False
     use_download_archive: bool = False
     playlist_items: str | None = None
@@ -249,45 +187,18 @@ def common_options(payload: BaseModel) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
-        # Android DownloadUtil uses a 5-second socket timeout and one retry
-        # for metadata extraction. Keep the web defaults aligned.
         "socket_timeout": 5,
         "retries": 1,
         "extractor_retries": 1,
         "noplaylist": not bool(getattr(payload, "include_playlist", False) or getattr(payload, "playlist", False)),
+        # Node.js + yt-dlp-ejs are installed in the container for full YouTube support.
+        "js_runtimes": {"node": {}},
+        # The local provider supplies PO tokens without requiring visitor cookies.
+        "extractor_args": {"youtube": {"player_client": ["mweb", "tv", "web_safari"]}},
     }
-    proxy = getattr(payload, "proxy_url", None)
-    if proxy:
-        p = urlparse(proxy)
-        if p.scheme not in {"http", "https", "socks4", "socks5", "socks5h"} or not p.hostname:
-            raise HTTPException(status_code=422, detail="عنوان Proxy غير صالح")
-        proxy_host = p.hostname.lower().rstrip(".")
-        if proxy_host in {"localhost", "localhost.localdomain"} or proxy_host.endswith((".localhost", ".local", ".internal")):
-            raise HTTPException(status_code=422, detail="عنوان Proxy للشبكات المحلية غير مسموح")
-        try:
-            proxy_ip = ipaddress.ip_address(proxy_host)
-            if not proxy_ip.is_global:
-                raise HTTPException(status_code=422, detail="عنوان Proxy للشبكات الخاصة غير مسموح")
-        except ValueError:
-            try:
-                proxy_addresses = {item[4][0] for item in socket.getaddrinfo(proxy_host, p.port or 1080, type=socket.SOCK_STREAM)}
-                if not proxy_addresses or any(not ipaddress.ip_address(address).is_global for address in proxy_addresses):
-                    raise HTTPException(status_code=422, detail="اسم Proxy يشير إلى شبكة غير مسموحة")
-            except socket.gaierror as exc:
-                raise HTTPException(status_code=422, detail="تعذر التحقق من عنوان Proxy") from exc
-        opts["proxy"] = proxy
-    if getattr(payload, "force_ipv4", False):
-        # Python API equivalent of yt-dlp's CLI -4 flag.
-        opts["source_address"] = "0.0.0.0"
-    cookie_text = getattr(payload, "cookies_text", None)
-    if cookie_text:
-        # Cookie data is kept only in a temporary file for the lifetime of this request.
-        cookie_path = DATA_DIR / f"cookies-{uuid.uuid4().hex}.txt"
-        fd = os.open(cookie_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as cookie_file:
-            cookie_file.write(cookie_text)
-        opts["cookiefile"] = str(cookie_path)
-        opts["_vyro_cookie_temp"] = str(cookie_path)
+    host = (urlparse(payload.url).hostname or "").lower().rstrip(".")
+    if host == "tiktok.com" or host.endswith(".tiktok.com"):
+        opts["impersonate"] = "chrome"
     return opts
 
 
@@ -329,11 +240,17 @@ def clean_info(info: dict[str, Any]) -> dict[str, Any]:
 @app.get("/api/health")
 def health():
     import shutil
+    try:
+        with socket.create_connection(("127.0.0.1", 4416), timeout=0.5):
+            youtube_pot_provider = True
+    except OSError:
+        youtube_pot_provider = False
     return {"ok": True, "service": "VYRO Web", "version": app.version,
             "engine": yt_dlp.version.__version__,
             "ffmpeg": shutil.which("ffmpeg") is not None,
             "aria2c": shutil.which("aria2c") is not None,
-            "auth_required": REQUIRE_AUTH}
+            "node": shutil.which("node") is not None,
+            "youtube_pot_provider": youtube_pot_provider}
 
 
 @app.post("/api/extract")
@@ -341,7 +258,6 @@ def extract(payload: ExtractRequest):
     url = validate_url(payload.url)
     opts = common_options(payload)
     opts.update({"skip_download": True, "extract_flat": "in_playlist" if payload.include_playlist else False})
-    cookie_temp = opts.pop("_vyro_cookie_temp", None)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -352,9 +268,6 @@ def extract(payload: ExtractRequest):
         raise
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"تعذر تحليل الرابط: {str(exc)[:500]}") from exc
-    finally:
-        if cookie_temp:
-            Path(cookie_temp).unlink(missing_ok=True)
 
 
 def run_download(job_id: str, payload: DownloadRequest) -> None:
@@ -436,13 +349,6 @@ def run_download(job_id: str, payload: DownloadRequest) -> None:
             opts["postprocessor_args"] = {"ThumbnailsConvertor+ffmpeg_o": [
                 "-c:v", "mjpeg", "-vf", "crop=if(gt(ih,iw),iw,ih):if(gt(iw,ih),ih,iw)"
             ]}
-    if payload.auto_subtitles and not payload.auto_translated_subtitles:
-        # Match Android's default: do not request YouTube translated captions.
-        opts["extractor_args"] = {"youtube": {"skip": ["translated_subs"]}}
-    if payload.user_agent:
-        if any(ch in payload.user_agent for ch in "\r\n"):
-            raise ValueError("User-Agent غير صالح")
-        opts["http_headers"] = {"User-Agent": payload.user_agent}
     if payload.use_aria2c:
         import shutil
         if not shutil.which("aria2c"):
@@ -543,12 +449,6 @@ def run_download(job_id: str, payload: DownloadRequest) -> None:
             raise ValueError("العنوان الجديد غير صالح")
         from yt_dlp.postprocessor.metadataparser import MetadataParserPP
         metadata_actions.append((MetadataParserPP.Actions.REPLACE, "title", ".+", payload.new_title))
-    if payload.rate_limit:
-        rate_match = re.fullmatch(r"(\d+(?:\.\d+)?)([KMG]?)", payload.rate_limit, re.I)
-        if not rate_match:
-            raise ValueError("صيغة حد سرعة التنزيل غير صحيحة")
-        scale = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}[rate_match.group(2).upper()]
-        opts["ratelimit"] = int(float(rate_match.group(1)) * scale)
     # YoutubeDL's embedded Python API expects postprocessors explicitly;
     # CLI-only convenience flags are not automatically expanded here.
     postprocessors: list[dict[str, Any]] = []
@@ -600,13 +500,17 @@ def run_download(job_id: str, payload: DownloadRequest) -> None:
             completed_paths.append(stored_path(filepath))
 
     opts["postprocessor_hooks"].append(after_move)
-    cookie_temp = None
     try:
         if cancel_event.is_set():
             raise DownloadCancelled("ألغى المستخدم مهمة التنزيل")
         extra = common_options(payload)
-        cookie_temp = extra.pop("_vyro_cookie_temp", None)
         opts.update(extra)
+        if payload.auto_subtitles and not payload.auto_translated_subtitles:
+            extractor_args = dict(opts.get("extractor_args") or {})
+            youtube_args = dict(extractor_args.get("youtube") or {})
+            youtube_args["skip"] = ["translated_subs"]
+            extractor_args["youtube"] = youtube_args
+            opts["extractor_args"] = extractor_args
         with yt_dlp.YoutubeDL(opts) as ydl:
             return_code = ydl.download([url])
         if return_code not in (None, 0):
@@ -640,8 +544,6 @@ def run_download(job_id: str, payload: DownloadRequest) -> None:
                 jobs[job_id].update({"status": "failed", "error": str(exc)[:700], "finished_at": time.time()})
         persist_job(job_id)
     finally:
-        if cookie_temp:
-            Path(cookie_temp).unlink(missing_ok=True)
         cancel_events.pop(job_id, None)
 
 
@@ -691,21 +593,15 @@ recover_pending_jobs()
 @app.post("/api/download", status_code=202)
 def create_download(payload: DownloadRequest):
     validate_url(payload.url)
-    with jobs_lock:
-        active = sum(1 for item in jobs.values() if item.get("status") in {"queued", "downloading", "processing", "cancelling"})
-        if active >= MAX_ACTIVE_JOBS:
-            raise HTTPException(status_code=429, detail="وصل الخادم إلى الحد الأقصى للتنزيلات المتزامنة")
     job_id = uuid.uuid4().hex
-    proxy = urlparse(payload.proxy_url) if payload.proxy_url else None
-    restart_recoverable = not bool(payload.cookies_text) and not bool(proxy and (proxy.username or proxy.password))
+    restart_recoverable = True
     job_snapshot = {
         "id": job_id, "status": "queued", "percent": 0, "created_at": time.time(),
         "files": [], "url": payload.url, "title": payload.media_title,
         "extractor": payload.extractor, "restart_recoverable": restart_recoverable,
     }
     if restart_recoverable:
-        # Never persist uploaded cookie contents or credential-bearing proxy URLs.
-        job_snapshot["request"] = payload.model_dump(exclude={"cookies_text"})
+        job_snapshot["request"] = payload.model_dump()
     with jobs_lock:
         jobs[job_id] = job_snapshot
         cancel_events[job_id] = threading.Event()
@@ -754,8 +650,7 @@ def export_history(format: str = "json"):
         return PlainTextResponse("\n".join(row["source_url"] for row in rows if row["source_url"]))
     if format != "json":
         raise HTTPException(status_code=422, detail="صيغة التصدير المدعومة: json أو txt")
-    from fastapi.responses import JSONResponse
-    return JSONResponse([dict(row) for row in rows], headers={"Content-Disposition": "attachment; filename=vyro-history.json"})
+        return JSONResponse([dict(row) for row in rows], headers={"Content-Disposition": "attachment; filename=vyro-history.json"})
 
 @app.delete("/api/history/{entry_id}")
 def delete_history_entry(entry_id: int):

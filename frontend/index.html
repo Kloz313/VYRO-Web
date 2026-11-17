@@ -4,6 +4,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#D1D9E6">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="VYRO">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <meta name="description" content="VYRO Web — تحليل روابط الوسائط وتنزيل الفيديو والصوت بالجودة والصيغة التي تختارها.">
   <title>VYRO Web | تنزيل الوسائط</title>
   <link rel="stylesheet" href="/styles.css">
@@ -40,6 +44,11 @@
       <span id="engineStatus" class="visually-hidden" aria-hidden="true">جارٍ فحص المحرك...</span>
     </footer>
   </div>
+  <aside id="installPrompt" class="install-prompt hidden">
+    <div><strong>ثبّت VYRO على جهازك</strong><br><small>وصول أسرع من الشاشة الرئيسية.</small></div>
+    <div><button id="installButton" type="button">تثبيت</button>
+    <button id="dismissInstall" type="button">لاحقاً</button></div>
+  </aside>
   <div id="toast" class="toast" role="status"></div>
   <script src="/app.js"></script>
 </body>
