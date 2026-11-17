@@ -69,10 +69,7 @@ function renderInfo(info, url) {
   ).join('') : '<span class="muted">لا توجد معلومات عن الترجمات لهذا الرابط.</span>';
 
   const entries = info.entries || [];
-  const playlistOptions = entries.length ? `<details class="playlist-picker"><summary>تحديد أرقام عناصر قائمة التشغيل (${info.playlist_count || entries.length})</summary>${info.entries_truncated ? '<p class="muted">تُعرض أول 200 عنصر للاختيار. عند إبقاء جميع العناصر محددة، ستُعالج القائمة كاملة.</p>' : ''}<div class="playlist-list">${entries.map((entry, i) => {
-    const index = entry.playlist_index || i + 1;
-    return `<label><input type="checkbox" class="playlist-entry" value="${index}" checked> <span>${index}.</span> ${safe(entry.title || `عنصر ${index}`)}</label>`;
-  }).join('')}</div><div class="playlist-actions"><button type="button" class="subtle-btn" id="selectAllPlaylist">تحديد الجميع</button><button type="button" class="subtle-btn" id="clearPlaylist">مسح التحديد</button></div></details>` : '';
+  // Advanced playlist-item selection is intentionally hidden; the basic full-playlist toggle remains.
 
   root.innerHTML = `
     <article class="result-card">
@@ -101,7 +98,6 @@ function renderInfo(info, url) {
         </div>
       </section>
       ${subtitleLanguages.length ? `<section class="subtitle-picker"><div class="field-label">لغات الترجمة المتاحة</div><div class="checks">${subtitleOptions}</div></section>` : ''}
-      ${playlistOptions}
 <div class="action-row"><button class="primary-btn" id="startDownload">تنزيل الآن ↓</button><button class="subtle-btn" id="copyTitle">نسخ عنوان المحتوى</button></div>
     <div id="downloadProgress" class="download-progress hidden" role="status" aria-live="polite">
       <div class="progress-heading"><span id="progressLabel">جارٍ إعداد التنزيل...</span><span id="progressPercent">0%</span></div>
@@ -112,21 +108,12 @@ function renderInfo(info, url) {
     </div>
     </article>`;
 
-  $('selectAllPlaylist')?.addEventListener('click', () => root.querySelectorAll('.playlist-entry').forEach(x => x.checked = true));
-  $('clearPlaylist')?.addEventListener('click', () => root.querySelectorAll('.playlist-entry').forEach(x => x.checked = false));
   $('startDownload').onclick = async () => {
     const button = $('startDownload'); button.disabled = true;
+    let downloadFrame = null;
+    const clientJobId = globalThis.crypto?.randomUUID?.() || 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 3 | 8)).toString(16); });
     try {
-      const selectedPlaylist = [...root.querySelectorAll('.playlist-entry:checked')].map(x => Number(x.value));
       const playlistEnabled = $('playlist')?.checked || false;
-      let playlistItems = null;
-      if (playlistEnabled && selectedPlaylist.length && selectedPlaylist.length < entries.length) {
-        playlistItems = selectedPlaylist.join(',');
-      }
-      if (playlistEnabled && entries.length && selectedPlaylist.length === 0) {
-        throw new Error('حدد عنصراً واحداً على الأقل من قائمة التشغيل.');
-      }
-
       const selectedSubs = [...root.querySelectorAll('.subtitle-language:checked')].map(x => x.value);
       const audioOnly = $('audioOnly').checked;
       const selectedVideoId = $('formatSelect').value;
@@ -148,13 +135,23 @@ function renderInfo(info, url) {
         if (resolution) requestedSort.push(`res:${resolution}`);
       }
 
+      downloadFrame = document.createElement('iframe');
+      downloadFrame.title = 'VYRO file download';
+      downloadFrame.setAttribute('aria-hidden', 'true');
+      downloadFrame.tabIndex = -1;
+      downloadFrame.style.cssText = 'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;bottom:0;left:0;border:0';
+      document.body.appendChild(downloadFrame);
+      // Navigate the frame directly from the click gesture. The server waits
+      // for this job ID, then returns the completed file as an attachment.
+      downloadFrame.src = `/api/jobs/${encodeURIComponent(clientJobId)}/download`;
+
       const response = await api('/api/download', {method: 'POST', body: JSON.stringify({
+        client_job_id: clientJobId,
         url, format_id: formatId,
         audio_only: audioOnly,
         audio_format: $('audioFormat').value || null,
         audio_quality: $('audioQuality').value,
         playlist: playlistEnabled,
-        playlist_items: playlistItems,
         subtitles: $('subs').checked || selectedSubs.length > 0,
         auto_subtitles: $('autoSubs').checked,
         auto_translated_subtitles: false,
@@ -170,24 +167,17 @@ function renderInfo(info, url) {
         media_title: info.title || null,
         extractor: info.extractor || null
       })});
-      toast('بدأت عملية التنزيل'); await monitorJob(response.id, button);
-    } catch (error) { toast(error.message); }
+      toast('بدأت عملية التنزيل');
+      const finalStatus = await monitorJob(response.id, button);
+      if (finalStatus === 'completed') setTimeout(() => downloadFrame?.remove(), 10 * 60 * 1000);
+      else if (['failed', 'cancelled', 'interrupted'].includes(finalStatus)) downloadFrame?.remove();
+    } catch (error) {
+      downloadFrame?.remove();
+      toast(error.message);
+    }
     finally { button.disabled = false; }
   };
   $('copyTitle').onclick = () => navigator.clipboard?.writeText(info.title || '').then(() => toast('تم نسخ العنوان'));
-}
-
-async function autoDownloadFiles(files) {
-  for (const file of files) {
-    const link = document.createElement('a');
-    link.href = `/api/files/${encodeURIComponent(file)}`;
-    link.download = file.split('/').pop();
-    link.hidden = true;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    await new Promise(resolve => setTimeout(resolve, 500));
-  }
 }
 
 async function monitorJob(jobId, startButton) {
@@ -197,6 +187,7 @@ async function monitorJob(jobId, startButton) {
   $('downloadLinks').innerHTML = '';
   $('cancelDownload').disabled = false;
   let cancelled = false;
+  let finalStatus = null;
   $('cancelDownload').onclick = async () => {
     $('cancelDownload').disabled = true;
     try { await api(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {method:'POST'}); }
@@ -207,6 +198,7 @@ async function monitorJob(jobId, startButton) {
     let job;
     try { job = await api(`/api/jobs/${encodeURIComponent(jobId)}`); }
     catch (error) { $('progressError').textContent = error.message; $('progressError').classList.remove('hidden'); break; }
+    finalStatus = job.status;
     const percent = Math.max(0, Math.min(100, job.percent ?? 0));
     $('progressLabel').textContent = labels[job.status] || job.status;
     $('progressPercent').textContent = `${percent}%`;
@@ -214,13 +206,17 @@ async function monitorJob(jobId, startButton) {
     $('progressBytes').textContent = job.total_bytes ? `${bytes(job.downloaded_bytes)} / ${bytes(job.total_bytes)}` : (job.downloaded_bytes ? bytes(job.downloaded_bytes) : '');
     $('progressSpeed').textContent = job.speed ? `${bytes(job.speed)}/ث` : '';
     $('progressEta').textContent = job.eta ? `المتبقي ${duration(job.eta)}` : '';
-    if (job.error) { $('progressError').textContent = job.error; $('progressError').classList.remove('hidden'); }
+    if (job.error) {
+      const diagnostics = Array.isArray(job.diagnostics) && job.diagnostics.length
+        ? `\n\nمؤشرات التشخيص:\n${job.diagnostics.join('\n')}` : '';
+      $('progressError').textContent = job.error + diagnostics;
+      $('progressError').classList.remove('hidden');
+    }
     if (job.status === 'completed') {
       $('cancelDownload').classList.add('hidden');
       if (job.files?.length) {
-        $('downloadLinks').innerHTML = job.files.map(file => `<a class="primary-btn download-link" href="/api/files/${encodeURIComponent(file)}">تنزيل الملف ${safe(file.split('/').pop())} ↓</a>`).join('');
-        await autoDownloadFiles(job.files);
-        toast('بدأ تنزيل الملفات تلقائياً');
+        $('downloadLinks').innerHTML = `<a class="subtle-btn download-link" href="/api/jobs/${encodeURIComponent(jobId)}/download">إذا لم يبدأ التنزيل تلقائياً، اضغط هنا</a>`;
+        toast('تم تجهيز الملف وبدء التنزيل');
       } else if (job.warning) {
         $('progressError').textContent = job.warning; $('progressError').classList.remove('hidden');
       }
@@ -233,6 +229,7 @@ async function monitorJob(jobId, startButton) {
     await new Promise(resolve => setTimeout(resolve, 1100));
   }
   startButton.disabled = false;
+  return finalStatus;
 }
 
 api('/api/health').then(status => {

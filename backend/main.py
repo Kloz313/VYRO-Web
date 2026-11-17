@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import ipaddress
+import importlib.metadata
 import json
 import os
 import sqlite3
 import re
 import socket
 import threading
+import tempfile
+import zipfile
 from contextlib import contextmanager
 import time
 import uuid
@@ -17,6 +21,7 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import yt_dlp
@@ -101,6 +106,7 @@ class ExtractRequest(BaseModel):
 
 class DownloadRequest(BaseModel):
     url: str = Field(min_length=8, max_length=4096)
+    client_job_id: str | None = Field(default=None, exclude=True)
     format_id: str | None = None
     audio_only: bool = False
     # Android extracts the source audio by default and converts only when the
@@ -183,18 +189,74 @@ def validate_url(value: str) -> str:
     return value.strip()
 
 
+class YtDlpDiagnostics:
+    """Collect only safe, high-level extractor signals; never retain raw URLs or tokens."""
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def _record(self, message: str) -> None:
+        text = str(message).lower()
+        event = None
+        if "po token providers: none" in text:
+            event = "لم يتعرف yt-dlp على موفر PO Token."
+        elif "po token providers:" in text and "bgutil" in text:
+            event = "تم تحميل إضافة BGUtil الخاصة برموز PO Token."
+        elif "generating a" in text and "po token" in text:
+            event = "طلب yt-dlp توليد PO Token لهذا الطلب."
+        elif "sign in to confirm" in text or "login_required" in text or "confirm you're not a bot" in text:
+            event = "طلب YouTube تسجيل الدخول أو التحقق من أن الطلب ليس آلياً."
+        elif "http error 403" in text or "http 403" in text:
+            event = "رفضت المنصة أحد الطلبات برمز HTTP 403."
+        elif "http error 429" in text or "http 429" in text:
+            event = "فرضت المنصة تحديداً مؤقتاً للطلبات (HTTP 429)."
+        if event and event not in self.events:
+            self.events.append(event)
+            del self.events[12:]
+
+    def debug(self, message: str) -> None:
+        self._record(message)
+
+    def warning(self, message: str) -> None:
+        self._record(message)
+
+    def error(self, message: str) -> None:
+        self._record(message)
+
+
+def explain_extractor_error(error: Exception | str) -> str:
+    message = str(error)
+    lower = message.lower()
+    if "sign in to confirm" in lower or "login_required" in lower or "confirm you're not a bot" in lower:
+        return ("طلب YouTube تسجيل الدخول أو التحقق من أن الطلب ليس آلياً. "
+                "وجود مزود PO Token لا يضمن تجاوز قيود عنوان IP أو تحديات المنصة.")
+    if "http error 403" in lower or "http 403" in lower or "403 forbidden" in lower:
+        return ("رفضت المنصة الطلب (HTTP 403). قد يرتبط ذلك بحماية المنصة أو قيود عنوان IP "
+                "أو انتهاء صلاحية رابط الوسائط؛ ولا يوجد حل عام مضمون لهذا الرفض.")
+    if "http error 429" in lower or "http 429" in lower or "too many requests" in lower:
+        return "فرضت المنصة تحديداً مؤقتاً للطلبات (HTTP 429). انتظر قليلاً ثم أعد المحاولة."
+    if "unsupported url" in lower or "no suitable extractor" in lower:
+        return "لم يتمكن yt-dlp من التعرف على رابط المحتوى أو لا يدعم هذا النوع من الروابط حالياً."
+    if "no video" in lower or "did not contain any video" in lower:
+        return "لم يعثر yt-dlp على فيديو قابل للاستخراج في هذا الرابط."
+    return f"تعذر إكمال العملية باستخدام yt-dlp: {message[:350]}"
+
+
 def common_options(payload: BaseModel) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
-        "socket_timeout": 5,
-        "retries": 1,
-        "extractor_retries": 1,
+        "socket_timeout": 20,
+        "retries": 3,
+        "extractor_retries": 3,
+        "fragment_retries": 3,
+        "file_access_retries": 3,
         "noplaylist": not bool(getattr(payload, "include_playlist", False) or getattr(payload, "playlist", False)),
         # Node.js + yt-dlp-ejs are installed in the container for full YouTube support.
         "js_runtimes": {"node": {}},
-        # The local provider supplies PO tokens without requiring visitor cookies.
-        "extractor_args": {"youtube": {"player_client": ["mweb", "tv", "web_safari"]}},
+        # mweb is the recommended client for PO-token-backed GVS requests;
+        # web_safari is retained as a secondary HLS-capable fallback.
+        "extractor_args": {"youtube": {"player_client": ["mweb", "web_safari"]}},
     }
     host = (urlparse(payload.url).hostname or "").lower().rstrip(".")
     if host == "tiktok.com" or host.endswith(".tiktok.com"):
@@ -245,19 +307,27 @@ def health():
             youtube_pot_provider = True
     except OSError:
         youtube_pot_provider = False
+    try:
+        importlib.metadata.version("bgutil-ytdlp-pot-provider")
+        youtube_pot_plugin = True
+    except importlib.metadata.PackageNotFoundError:
+        youtube_pot_plugin = False
     return {"ok": True, "service": "VYRO Web", "version": app.version,
             "engine": yt_dlp.version.__version__,
             "ffmpeg": shutil.which("ffmpeg") is not None,
             "aria2c": shutil.which("aria2c") is not None,
             "node": shutil.which("node") is not None,
-            "youtube_pot_provider": youtube_pot_provider}
+            "youtube_pot_provider": youtube_pot_provider,
+            "youtube_pot_plugin": youtube_pot_plugin}
 
 
 @app.post("/api/extract")
 def extract(payload: ExtractRequest):
     url = validate_url(payload.url)
+    diagnostics = YtDlpDiagnostics()
     opts = common_options(payload)
-    opts.update({"skip_download": True, "extract_flat": "in_playlist" if payload.include_playlist else False})
+    opts.update({"skip_download": True, "extract_flat": "in_playlist" if payload.include_playlist else False,
+                 "logger": diagnostics, "verbose": True})
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -267,7 +337,10 @@ def extract(payload: ExtractRequest):
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"تعذر تحليل الرابط: {str(exc)[:500]}") from exc
+        detail = explain_extractor_error(exc)
+        if diagnostics.events:
+            detail += "\n" + "\n".join(diagnostics.events[:4])
+        raise HTTPException(status_code=422, detail=detail) from exc
 
 
 def run_download(job_id: str, payload: DownloadRequest) -> None:
@@ -504,6 +577,8 @@ def run_download(job_id: str, payload: DownloadRequest) -> None:
         if cancel_event.is_set():
             raise DownloadCancelled("ألغى المستخدم مهمة التنزيل")
         extra = common_options(payload)
+        diagnostics = YtDlpDiagnostics()
+        extra.update({"logger": diagnostics, "verbose": True})
         opts.update(extra)
         if payload.auto_subtitles and not payload.auto_translated_subtitles:
             extractor_args = dict(opts.get("extractor_args") or {})
@@ -525,6 +600,8 @@ def run_download(job_id: str, payload: DownloadRequest) -> None:
         with jobs_lock:
             completion_update = {"status": "completed", "percent": 100, "finished_at": time.time(),
                                  "files": completed_paths}
+            if diagnostics.events:
+                completion_update["diagnostics"] = diagnostics.events[:8]
             if not completed_paths:
                 completion_update["warning"] = "لم يُنشئ المحرك ملفاً جديداً؛ قد تكون العناصر موجودة مسبقاً في سجل التنزيلات."
             jobs[job_id].update(completion_update)
@@ -541,7 +618,11 @@ def run_download(job_id: str, payload: DownloadRequest) -> None:
             if cancel_event.is_set():
                 jobs[job_id].update({"status": "cancelled", "error": "ألغى المستخدم مهمة التنزيل", "finished_at": time.time()})
             else:
-                jobs[job_id].update({"status": "failed", "error": str(exc)[:700], "finished_at": time.time()})
+                failure = explain_extractor_error(exc)
+                update = {"status": "failed", "error": failure, "finished_at": time.time()}
+                if "diagnostics" in locals() and diagnostics.events:
+                    update["diagnostics"] = diagnostics.events[:8]
+                jobs[job_id].update(update)
         persist_job(job_id)
     finally:
         cancel_events.pop(job_id, None)
@@ -593,7 +674,19 @@ recover_pending_jobs()
 @app.post("/api/download", status_code=202)
 def create_download(payload: DownloadRequest):
     validate_url(payload.url)
-    job_id = uuid.uuid4().hex
+    if payload.client_job_id:
+        try:
+            job_id = str(uuid.UUID(payload.client_job_id))
+        except (ValueError, AttributeError):
+            raise HTTPException(status_code=422, detail="معرّف مهمة التنزيل غير صالح")
+        with jobs_lock:
+            if job_id in jobs:
+                raise HTTPException(status_code=409, detail="معرّف مهمة التنزيل مستخدم مسبقاً")
+        with db() as conn:
+            if conn.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone():
+                raise HTTPException(status_code=409, detail="معرّف مهمة التنزيل مستخدم مسبقاً")
+    else:
+        job_id = uuid.uuid4().hex
     restart_recoverable = True
     job_snapshot = {
         "id": job_id, "status": "queued", "percent": 0, "created_at": time.time(),
@@ -676,13 +769,79 @@ def get_job(job_id: str):
 
 @app.get("/api/files/{filename:path}")
 def download_file(filename: str):
+    path = resolve_download_path(filename)
+    return FileResponse(path, filename=path.name)
+
+
+def resolve_download_path(filename: str) -> Path:
     relative = Path(filename)
     if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
         raise HTTPException(status_code=404, detail="الملف غير موجود")
     path = (DOWNLOAD_DIR / relative).resolve()
     if DOWNLOAD_DIR.resolve() not in path.parents or not path.is_file():
         raise HTTPException(status_code=404, detail="الملف غير موجود")
-    return FileResponse(path, filename=path.name)
+    return path
+
+
+@app.get("/api/jobs/{job_id}/download")
+async def download_job_result(job_id: str):
+    # The browser opens this request immediately after the visitor presses
+    # Download. Keep the response pending until yt-dlp finishes, then return
+    # one attachment (or a ZIP for playlists) without requiring another click.
+    loop = asyncio.get_running_loop()
+    start_time = loop.time()
+    missing_job_deadline = start_time + 20
+    deadline = start_time + 3 * 60 * 60
+    job: dict[str, Any] | None = None
+    while loop.time() < deadline:
+        with jobs_lock:
+            current = jobs.get(job_id)
+            job = dict(current) if current else None
+        if job is None:
+            with db() as conn:
+                row = conn.execute("SELECT data FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row:
+                try:
+                    job = json.loads(row["data"])
+                except (TypeError, json.JSONDecodeError):
+                    job = None
+        if job is None:
+            if loop.time() >= missing_job_deadline:
+                raise HTTPException(status_code=404, detail="مهمة التنزيل غير موجودة")
+            await asyncio.sleep(0.25)
+            continue
+        status = job.get("status")
+        if status == "completed":
+            break
+        if status in {"failed", "cancelled", "interrupted"}:
+            raise HTTPException(status_code=409, detail=job.get("error") or "تعذر تجهيز الملف للتنزيل")
+        await asyncio.sleep(1)
+    else:
+        raise HTTPException(status_code=504, detail="انتهت مهلة انتظار تجهيز الملف")
+
+    files = list(dict.fromkeys(job.get("files") or []))
+    if not files:
+        raise HTTPException(status_code=404, detail=job.get("warning") or "لم يتم إنشاء ملف للتنزيل")
+    paths = [(name, resolve_download_path(name)) for name in files]
+    if len(paths) == 1:
+        name, path = paths[0]
+        return FileResponse(path, filename=path.name)
+
+    # A playlist becomes one archive so the browser only needs one download.
+    temp = tempfile.NamedTemporaryFile(prefix="vyro-playlist-", suffix=".zip", dir=DATA_DIR, delete=False)
+    archive_path = Path(temp.name)
+    temp.close()
+    try:
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+            for relative_name, path in paths:
+                archive.write(path, arcname=Path(relative_name).as_posix())
+    except Exception:
+        archive_path.unlink(missing_ok=True)
+        raise
+    return FileResponse(
+        archive_path, filename="VYRO-playlist.zip",
+        background=BackgroundTask(lambda: archive_path.unlink(missing_ok=True)),
+    )
 
 
 app.mount("/", StaticFiles(directory=FRONTEND, html=True), name="frontend")
