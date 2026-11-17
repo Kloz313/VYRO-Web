@@ -1,5 +1,5 @@
 FROM node:22-bookworm-slim AS pot-provider-build
-RUN apt-get update && apt-get install -y --no-install-recommends git python3 make g++ pkg-config libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git python3 make g++ pkg-config libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/bgutil-ytdlp-pot-provider
 RUN git clone --depth 1 --branch 2.0.2 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git .
 WORKDIR /opt/bgutil-ytdlp-pot-provider/server
