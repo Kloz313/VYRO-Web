@@ -11,7 +11,7 @@ import socket
 import threading
 import tempfile
 import zipfile
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +25,7 @@ from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import yt_dlp
+from yt_dlp.networking.impersonate import ImpersonateTarget
 
 ROOT = Path(__file__).resolve().parent.parent
 FRONTEND = ROOT / "frontend"
@@ -34,6 +35,8 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 (DOWNLOAD_DIR / "Audio").mkdir(parents=True, exist_ok=True)
 (DOWNLOAD_DIR / "Video").mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "vyro-web.sqlite3"
+FILE_RETENTION_HOURS = max(1, min(int(os.getenv("VYRO_FILE_RETENTION_HOURS", "24")), 168))
+FILE_RETENTION_SECONDS = FILE_RETENTION_HOURS * 60 * 60
 
 @contextmanager
 def db():
@@ -89,11 +92,26 @@ def init_db() -> None:
             )
 
 init_db()
-app = FastAPI(title="VYRO Web API", version="0.3.0", description="Web edition of VYRO Downloader")
+
+
+@asynccontextmanager
+async def app_lifespan(_app):
+    cleanup_task = asyncio.create_task(_cleanup_loop())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="VYRO Web API", version="0.3.0", description="Web edition of VYRO Downloader", lifespan=app_lifespan)
 
 # Public service: no account gate, per-IP request quota, or per-user download quota.
 # Requests enter the worker queue; throughput is bounded only by host resources.
-executor = ThreadPoolExecutor()
+executor = ThreadPoolExecutor(max_workers=max(1, min(int(os.getenv("VYRO_DOWNLOAD_WORKERS", "2")), 16)))
 jobs: dict[str, dict[str, Any]] = {}
 jobs_lock = threading.RLock()
 cancel_events: dict[str, threading.Event] = {}
@@ -204,6 +222,23 @@ class YtDlpDiagnostics:
             event = "تم تحميل إضافة BGUtil الخاصة برموز PO Token."
         elif "generating a" in text and "po token" in text:
             event = "طلب yt-dlp توليد PO Token لهذا الطلب."
+        elif "po token" in text and ("generated" in text or "successfully" in text):
+            event = "أبلغ yt-dlp عن اكتمال توليد PO Token."
+        elif "downloading" in text and "player api json" in text:
+            # Record the selected YouTube player client, but never the raw log line.
+            match = re.search(r"downloading\s+([a-z0-9_-]+)\s+player api json", text)
+            if match:
+                event = f"اختار YouTube عميل المشغل: {match.group(1)}."
+        elif "solving js challenge" in text:
+            if "native python" in text:
+                event = "بدأ TikTok حل تحدي JavaScript بالتنفيذ الأصلي في Python."
+            else:
+                event = "بدأ yt-dlp حل تحدي JavaScript الخاص بـ TikTok."
+        elif "downloading webpage with challenge cookie" in text:
+            event = "أنشأ yt-dlp challenge cookie وأعاد طلب صفحة TikTok."
+        elif ("failed to solve js challenge" in text or "challenge solving failed" in text
+              or "unable to solve js challenge" in text):
+            event = "فشل yt-dlp في حل تحدي JavaScript الخاص بالمنصة."
         elif "sign in to confirm" in text or "login_required" in text or "confirm you're not a bot" in text:
             event = "طلب YouTube تسجيل الدخول أو التحقق من أن الطلب ليس آلياً."
         elif "http error 403" in text or "http 403" in text:
@@ -237,6 +272,10 @@ def explain_extractor_error(error: Exception | str) -> str:
         return "فرضت المنصة تحديداً مؤقتاً للطلبات (HTTP 429). انتظر قليلاً ثم أعد المحاولة."
     if "unsupported url" in lower or "no suitable extractor" in lower:
         return "لم يتمكن yt-dlp من التعرف على رابط المحتوى أو لا يدعم هذا النوع من الروابط حالياً."
+    if ("javascript runtime" in lower or "yt-dlp-ejs" in lower
+            or "js challenge" in lower or "challenge solving failed" in lower):
+        return ("تعذر إكمال التحقق البرمجي الذي تتطلبه المنصة. تحقق من توفر مكونات JavaScript "
+                "وتوافق إصدار yt-dlp، وقد يكون التحدي مرتبطاً أيضاً بقيود المنصة أو عنوان IP.")
     if "no video" in lower or "did not contain any video" in lower:
         return "لم يعثر yt-dlp على فيديو قابل للاستخراج في هذا الرابط."
     return f"تعذر إكمال العملية باستخدام yt-dlp: {message[:350]}"
@@ -252,30 +291,55 @@ def common_options(payload: BaseModel) -> dict[str, Any]:
         "fragment_retries": 3,
         "file_access_retries": 3,
         "noplaylist": not bool(getattr(payload, "include_playlist", False) or getattr(payload, "playlist", False)),
-        # Node.js + yt-dlp-ejs are installed in the container for full YouTube support.
+        # Node.js + yt-dlp-ejs are installed in the container for YouTube JS challenges.
         "js_runtimes": {"node": {}},
-        # mweb is the recommended client for PO-token-backed GVS requests;
-        # web_safari is retained as a secondary HLS-capable fallback.
-        "extractor_args": {"youtube": {"player_client": ["mweb", "web_safari"]}},
+        # Do not force YouTube player_client here. Android leaves this to yt-dlp's
+        # own defaults; the supplied successful device log selected visionos.
+        # A fixed list can suppress newer/default clients and change format availability.
     }
     host = (urlparse(payload.url).hostname or "").lower().rstrip(".")
     if host == "tiktok.com" or host.endswith(".tiktok.com"):
-        opts["impersonate"] = "chrome"
+        opts["impersonate"] = ImpersonateTarget.from_str("chrome")
     return opts
 
 
+def clean_format(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "format_id": item.get("format_id"),
+        "format": item.get("format"),
+        "format_note": item.get("format_note"),
+        "ext": item.get("ext"),
+        "resolution": item.get("resolution") or (f"{item.get('height')}p" if item.get("height") else None),
+        "width": item.get("width"),
+        "height": item.get("height"),
+        "fps": item.get("fps"),
+        "vcodec": item.get("vcodec"),
+        "acodec": item.get("acodec"),
+        "video_ext": item.get("video_ext"),
+        "audio_ext": item.get("audio_ext"),
+        "filesize": item.get("filesize"),
+        "filesize_approx": item.get("filesize_approx"),
+        "vbr": item.get("vbr"),
+        "abr": item.get("abr"),
+        "tbr": item.get("tbr"),
+    }
+
+
 def clean_info(info: dict[str, Any]) -> dict[str, Any]:
-    formats = []
-    for f in info.get("formats") or []:
-        formats.append({
-            "format_id": f.get("format_id"), "ext": f.get("ext"),
-            "resolution": f.get("resolution") or (f"{f.get('height')}p" if f.get("height") else None),
-            "width": f.get("width"), "height": f.get("height"),
-            "filesize": f.get("filesize") or f.get("filesize_approx"),
-            "vcodec": f.get("vcodec"), "acodec": f.get("acodec"),
-            "fps": f.get("fps"), "format_note": f.get("format_note"),
-            "format": f.get("format"),
-        })
+    formats = [clean_format(item) for item in (info.get("formats") or []) if isinstance(item, dict)]
+    requested_formats = [clean_format(item) for item in (info.get("requested_formats") or []) if isinstance(item, dict)]
+    requested_downloads = []
+    for item in info.get("requested_downloads") or []:
+        if not isinstance(item, dict):
+            continue
+        normalized = clean_format(item)
+        normalized["filename"] = item.get("filename")
+        normalized["requested_formats"] = [clean_format(part) for part in (item.get("requested_formats") or []) if isinstance(part, dict)]
+        requested_downloads.append(normalized)
+    chapters = [
+        {"title": chapter.get("title"), "start_time": chapter.get("start_time"), "end_time": chapter.get("end_time")}
+        for chapter in (info.get("chapters") or []) if isinstance(chapter, dict)
+    ]
     entries = []
     for entry in info.get("entries") or []:
         if not entry:
@@ -283,15 +347,27 @@ def clean_info(info: dict[str, Any]) -> dict[str, Any]:
         entries.append({"id": entry.get("id"), "title": entry.get("title"), "url": entry.get("webpage_url") or entry.get("url"), "duration": entry.get("duration"), "thumbnail": entry.get("thumbnail"), "playlist_index": entry.get("playlist_index")})
     playlist_count = info.get("playlist_count") or len(entries)
     return {
-        "id": info.get("id"), "title": info.get("title"),
-        "webpage_url": info.get("webpage_url"), "extractor": info.get("extractor_key") or info.get("extractor"),
+        "id": info.get("id"), "title": info.get("title"), "fulltitle": info.get("fulltitle"),
+        "webpage_url": info.get("webpage_url"), "original_url": info.get("original_url"),
+        "extractor": info.get("extractor_key") or info.get("extractor"),
+        "extractor_key": info.get("extractor_key"),
         "description": info.get("description"), "thumbnail": info.get("thumbnail"),
-        "duration": info.get("duration"), "uploader": info.get("uploader"),
+        "duration": info.get("duration"), "duration_string": info.get("duration_string"),
+        "uploader": info.get("uploader"), "uploader_id": info.get("uploader_id"),
         "channel": info.get("channel"), "view_count": info.get("view_count"),
-        "upload_date": info.get("upload_date"), "formats": formats,
-        "subtitles": {lang: [{"ext": item.get("ext"), "name": item.get("name")} for item in items]
+        "like_count": info.get("like_count"), "comment_count": info.get("comment_count"),
+        "upload_date": info.get("upload_date"), "availability": info.get("availability"),
+        "live_status": info.get("live_status"), "tags": info.get("tags") or [],
+        "format": info.get("format"), "format_id": info.get("format_id"),
+        "ext": info.get("ext"), "vcodec": info.get("vcodec"), "acodec": info.get("acodec"),
+        "filename": info.get("filename"),
+        "formats": formats, "requested_formats": requested_formats,
+        "requested_downloads": requested_downloads, "chapters": chapters,
+        "subtitles": {lang: [{"ext": item.get("ext"), "name": item.get("name"), "protocol": item.get("protocol")}
+                              for item in items]
                       for lang, items in (info.get("subtitles") or {}).items()},
-        "automatic_captions": {lang: [{"ext": item.get("ext"), "name": item.get("name")} for item in items]
+        "automatic_captions": {lang: [{"ext": item.get("ext"), "name": item.get("name"), "protocol": item.get("protocol")}
+                                       for item in items]
                                for lang, items in (info.get("automatic_captions") or {}).items()},
         "playlist": info.get("_type") in {"playlist", "multi_video"} or bool(info.get("entries")),
         "entries": entries[:200], "playlist_count": playlist_count,
@@ -842,6 +918,73 @@ async def download_job_result(job_id: str):
         archive_path, filename="VYRO-playlist.zip",
         background=BackgroundTask(lambda: archive_path.unlink(missing_ok=True)),
     )
+
+
+def cleanup_expired_data(now: float | None = None, retention_seconds: int | None = None) -> dict[str, int]:
+    """Remove old terminal job snapshots and media files; never touch active jobs."""
+    current = now if now is not None else time.time()
+    retention = retention_seconds if retention_seconds is not None else FILE_RETENTION_SECONDS
+    cutoff = current - retention
+    terminal = {"completed", "failed", "cancelled", "interrupted"}
+    active_paths: set[str] = set()
+    removed_job_ids: set[str] = set()
+    with jobs_lock:
+        for job_id, job in list(jobs.items()):
+            if job.get("status") not in terminal:
+                filename = job.get("filename")
+                if filename:
+                    try:
+                        active_paths.add((DOWNLOAD_DIR / filename).resolve().as_posix())
+                    except (OSError, ValueError):
+                        pass
+                continue
+            finished = job.get("finished_at") or job.get("created_at") or current
+            if finished < cutoff:
+                jobs.pop(job_id, None)
+                removed_job_ids.add(job_id)
+    with db() as conn:
+        old_rows = conn.execute(
+            "SELECT id FROM jobs WHERE status IN ('completed','failed','cancelled','interrupted') AND updated_at < ?",
+            (cutoff,),
+        ).fetchall()
+        if old_rows:
+            conn.executemany("DELETE FROM jobs WHERE id=?", [(row["id"],) for row in old_rows])
+            removed_job_ids.update(row["id"] for row in old_rows)
+        conn.execute("DELETE FROM download_history WHERE completed_at < ?", (cutoff,))
+    removed_files = 0
+    for path in DOWNLOAD_DIR.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            if path.resolve().as_posix() in active_paths or path.stat().st_mtime >= cutoff:
+                continue
+            path.unlink(missing_ok=True)
+            removed_files += 1
+        except OSError:
+            continue
+    for path in DATA_DIR.glob("vyro-playlist-*.zip"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+                removed_files += 1
+        except OSError:
+            continue
+    for directory in sorted((p for p in DOWNLOAD_DIR.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    return {"jobs": len(removed_job_ids), "files": removed_files}
+
+
+async def _cleanup_loop() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(cleanup_expired_data)
+        except Exception:
+            # Cleanup is best-effort and must never stop the API service.
+            pass
+        await asyncio.sleep(3600)
 
 
 app.mount("/", StaticFiles(directory=FRONTEND, html=True), name="frontend")

@@ -42,3 +42,32 @@
 - Rewrote Arabic interface labels and helper text for clearer, more consistent terminology.
 - Kept the download workflow and element IDs intact; removed the visible theme switch to respect Seal's confirmed Light interface style.
 - See `docs/SEAL-VISUAL-ADAPTATION.md` for the source-derived facts and the implementation choices that remain adaptations rather than verified original role mappings.
+
+
+## 2026-11-18 — direct Android source parity pass
+
+- Reopened the supplied `VYRO-main.zip` and compared the existing web package against `FormatPage.kt`, `VideoInfo.kt`, `DownloadUtil.kt`, `Downloader.kt`, `PreferenceUtil.kt`, and the engine initialization/update paths.
+- Extended extraction metadata with requested formats/downloads, chapters, additional media metadata and the fields required for the suggested format.
+- Added the suggested format and separated muxed video formats from video-only formats in the visitor selector.
+- Added user-facing time clipping, chapter splitting and output-title replacement, mapped to the existing yt-dlp/FFmpeg backend options.
+- Changed the visible audio selector to one stream by default, matching Android's default multi-audio preference (off); no Android settings screen was added.
+- Kept task history, app settings, cookie profiles, proxy/IPv4/rate-limit controls and Android-only storage/UI behavior out of the visitor interface.
+- Added a detailed Arabic source-to-web comparison and a note about the VYRO naming restriction present in the supplied Android README.
+- Automated tests: 40 passed. Tests use a mocked yt-dlp engine; real platform extraction, FFmpeg processing, Docker build and hosting deployment remain unverified.
+
+## 2026-11-18 — source-parity UI cache refresh
+- Bumped the service-worker cache to `vyro-web-v4` so installed PWAs do not keep serving the previous `app.js`/`styles.css` after the new source-parity controls are deployed.
+- Final offline validation after the worker-pool configuration: 39 automated tests passed; Python, JavaScript and HTML syntax checks passed.
+
+## 2026-11-18 — Android engine-behavior alignment
+- Removed the forced YouTube `player_client` list from the shared web extractor options. The supplied Android download log selected `visionos` automatically; the web override had restricted extraction to `mweb` and `web_safari`.
+- Kept Node.js as the configured JavaScript runtime and retained BGUtil/PO Token support; this change does not disable either component.
+- Expanded safe diagnostics to record the selected YouTube player client and TikTok's native-Python JS-challenge flow without retaining raw URLs, cookies, or tokens.
+- Added clearer error classification for JavaScript challenge/runtime failures.
+- Validation: 43 automated tests passed; Python compilation and JavaScript syntax checks passed. No live platform extraction, Docker build, or Railway deployment was performed.
+
+
+## 2026-11-18 — Android yt-dlp nightly version alignment
+- Updated the web dependency from the open-ended `2026.10.26` minimum to the exact Android-reported nightly build `2026.11.17.232707` (PyPI prerelease identifier `2026.11.17.232707.dev0`).
+- This nightly contains YouTube extractor fixes for web_embedded client policies and post-live stream handling.
+- A clean package installation, Docker image build, Railway deployment and live platform downloads are still pending; mocked tests do not prove extractor success.

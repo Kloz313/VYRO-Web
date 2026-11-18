@@ -1,5 +1,5 @@
 fastapi==0.121.0
 uvicorn[standard]==0.38.0
-yt-dlp[default,curl-cffi]>=2026.10.26
+yt-dlp[default,curl-cffi]==2026.11.17.232707.dev0
 python-multipart==0.0.20
 bgutil-ytdlp-pot-provider==2.0.2

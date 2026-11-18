@@ -50,12 +50,18 @@ function renderInfo(info, url) {
   const formats = (info.formats || []).filter(f => f.format_id && f.ext)
     .sort((a, b) => (b.height || 0) - (a.height || 0) || (b.fps || 0) - (a.fps || 0));
   const videoFormats = formats.filter(f => f.vcodec && f.vcodec !== 'none');
+  const muxedFormats = videoFormats.filter(f => f.acodec && f.acodec !== 'none');
+  const videoOnlyFormats = videoFormats.filter(f => !f.acodec || f.acodec === 'none');
   const audioFormats = formats.filter(f => f.acodec && f.acodec !== 'none' && f.vcodec === 'none');
-  const videoOptions = videoFormats.map(f => {
-    const kind = f.acodec === 'none' ? 'فيديو فقط' : 'فيديو وصوت';
+  const requestedFormats = info.requested_formats?.length ? info.requested_formats : (info.requested_downloads || []).flatMap(item => item.requested_formats?.length ? item.requested_formats : [item]);
+  const suggestedIds = requestedFormats.map(f => f.format_id).filter(Boolean);
+  const suggestedLabel = suggestedIds.length ? requestedFormats.map(f => f.format || f.format_note || f.ext || f.format_id).filter(Boolean).join(' + ') : 'أفضل صيغة متاحة';
+  const suggestedOption = suggestedIds.length ? `<option value="__suggested__" selected>الصيغة المقترحة · ${safe(suggestedLabel)}</option>` : '';
+  const makeVideoOption = (f, kind) => {
     const label = [f.resolution || f.format_note || 'جودة غير محددة', f.ext, kind, f.fps ? `${f.fps}fps` : '', bytes(f.filesize)].filter(Boolean).join(' · ');
     return `<option value="${safe(f.format_id)}">${safe(label)}</option>`;
-  }).join('');
+  };
+  const videoOptions = `${suggestedOption}<option value="">تلقائي — وفق أفضل جودة متاحة</option>${muxedFormats.length ? `<optgroup label="فيديو مع صوت">${muxedFormats.map(f => makeVideoOption(f, 'فيديو وصوت')).join('')}</optgroup>` : ''}${videoOnlyFormats.length ? `<optgroup label="فيديو فقط">${videoOnlyFormats.map(f => makeVideoOption(f, 'فيديو فقط')).join('')}</optgroup>` : ''}`;
   const audioOptions = audioFormats.map(f => {
     const label = [f.format_note || f.ext, f.ext, f.acodec, bytes(f.filesize)].filter(Boolean).join(' · ');
     return `<option value="${safe(f.format_id)}">${safe(label)}</option>`;
@@ -79,10 +85,10 @@ function renderInfo(info, url) {
       <section class="settings-section">
         <div class="section-heading"><h3>جودة الفيديو والصوت</h3><p>اختر الدقة والترميز ومسار الصوت وفق ما يتيحه المصدر.</p></div>
         <div class="form-grid">
-          <label class="field">جودة الفيديو<select id="formatSelect"><option value="">تلقائي — وفق أفضل جودة متاحة</option>${videoOptions}</select></label>
+          <label class="field">جودة الفيديو<select id="formatSelect">${videoOptions || '<option value="">تلقائي — وفق أفضل جودة متاحة</option>'}</select></label>
           <label class="field">الدقة المطلوبة<select id="videoResolution"><option value="">أعلى دقة متاحة</option><option value="2160">4K · 2160p</option><option value="1440">1440p</option><option value="1080">1080p</option><option value="720">720p</option><option value="480">480p</option><option value="360">360p</option></select></label>
           <label class="field">ترميز الفيديو<select id="videoCodec"><option value="quality">جودة أعلى (AV1 / VP9)</option><option value="compatibility">توافق أوسع (H.264)</option><option value="">اختيار تلقائي</option></select></label>
-          <label class="field">مسارات الصوت المتاحة<select id="audioStreamSelect" multiple size="4">${audioOptions}</select><small>يمكن اختيار أكثر من مسار. اترك الحقل دون تحديد للاختيار التلقائي.</small></label>
+          <label class="field">مسار الصوت المتاح<select id="audioStreamSelect" size="1"><option value="">اختيار تلقائي</option>${audioOptions}</select><small>اختر مساراً صوتياً واحداً عند الحاجة إلى فصل الصوت عن الفيديو.</small></label>
           <label class="field">صيغة الصوت<select id="audioFormat"><option value="" selected>الاحتفاظ بالصيغة الأصلية</option><option value="mp3">MP3</option><option value="m4a">M4A</option><option value="opus">OPUS</option><option value="wav">WAV</option><option value="flac">FLAC</option><option value="aac">AAC</option><option value="alac">ALAC</option></select></label>
           <label class="field">جودة الصوت<select id="audioQuality"><option value="0">تلقائي</option><option value="1">عالية — 192 kbps</option><option value="2">متوسطة — 128 kbps</option><option value="3">اقتصادية — 64 kbps</option><option value="4">منخفضة — 32 kbps</option></select></label>
         </div>
@@ -95,7 +101,14 @@ function renderInfo(info, url) {
           <label><input type="checkbox" id="subs"> تنزيل الترجمات</label>
           <label><input type="checkbox" id="autoSubs"> تضمين الترجمات التلقائية</label>
           <label><input type="checkbox" id="embedSubs"> دمج الترجمة داخل الفيديو</label>
+          ${info.duration ? '<label><input type="checkbox" id="clipEnabled"> قص جزء محدد من الفيديو</label>' : ''}
+          ${(info.chapters || []).length ? '<label><input type="checkbox" id="splitChapters"> تقسيم الفيديو حسب الفصول</label>' : ''}
         </div>
+        ${info.duration ? `<div id="clipFields" class="form-grid clip-fields hidden">
+          <label class="field">بداية المقطع (بالثواني)<input id="clipStart" type="number" min="0" max="${Number(info.duration)}" step="0.1" value="0"></label>
+          <label class="field">نهاية المقطع (بالثواني)<input id="clipEnd" type="number" min="0" max="${Number(info.duration)}" step="0.1" value="${Number(info.duration).toFixed(1)}"></label>
+        </div>` : ''}
+        <label class="field rename-field">اسم الملف (اختياري)<input id="newTitle" type="text" maxlength="240" placeholder="اتركه فارغاً لاستخدام العنوان الأصلي"></label>
       </section>
       ${subtitleLanguages.length ? `<section class="subtitle-picker"><div class="field-label">لغات الترجمة المتاحة</div><div class="checks">${subtitleOptions}</div></section>` : ''}
 <div class="action-row"><button class="primary-btn" id="startDownload">تنزيل الآن ↓</button><button class="subtle-btn" id="copyTitle">نسخ عنوان المحتوى</button></div>
@@ -117,10 +130,11 @@ function renderInfo(info, url) {
       const selectedSubs = [...root.querySelectorAll('.subtitle-language:checked')].map(x => x.value);
       const audioOnly = $('audioOnly').checked;
       const selectedVideoId = $('formatSelect').value;
-      const selectedAudioIds = [...$('audioStreamSelect').selectedOptions].map(option => option.value);
+      const selectedAudioIds = $('audioStreamSelect').value ? [$('audioStreamSelect').value] : [];
       const selectedVideoFormat = formats.find(format => format.format_id === selectedVideoId);
       let formatId = null;
       if (audioOnly) formatId = selectedAudioIds.length ? selectedAudioIds.join('+') : null;
+      else if (selectedVideoId === '__suggested__') formatId = suggestedIds.length ? suggestedIds.join('+') : null;
       else if (selectedVideoId && selectedAudioIds.length) formatId = [selectedVideoId, ...selectedAudioIds].join('+');
       else if (selectedVideoId && selectedVideoFormat?.acodec === 'none') formatId = `${selectedVideoId}+ba/b`;
       else if (selectedVideoId) formatId = selectedVideoId;
@@ -135,6 +149,13 @@ function renderInfo(info, url) {
         if (resolution) requestedSort.push(`res:${resolution}`);
       }
 
+      const clipEnabled = $('clipEnabled')?.checked || false;
+      const clipStart = clipEnabled ? Number($('clipStart').value) : null;
+      const clipEnd = clipEnabled ? Number($('clipEnd').value) : null;
+      if (clipEnabled && (!Number.isFinite(clipStart) || !Number.isFinite(clipEnd) || clipEnd <= clipStart)) {
+        throw new Error('يجب أن يكون وقت نهاية المقطع أكبر من وقت بدايته.');
+      }
+      const splitChapters = !audioOnly && ($('splitChapters')?.checked || false);
       downloadFrame = document.createElement('iframe');
       downloadFrame.title = 'VYRO file download';
       downloadFrame.setAttribute('aria-hidden', 'true');
@@ -159,10 +180,13 @@ function renderInfo(info, url) {
         embed_subtitles: $('embedSubs').checked,
         keep_subtitle_files: false,
         embed_metadata: true,
-        embed_chapters: true,
         concurrent_fragments: 8,
-        merge_audio_streams: selectedAudioIds.length > 1 || (!!selectedVideoId && selectedAudioIds.length > 0 && selectedVideoFormat?.acodec !== 'none'),
+        merge_audio_streams: selectedAudioIds.length > 1,
         format_sort: requestedSort,
+        download_sections: clipEnabled ? [`${clipStart}-${clipEnd}`] : [],
+        split_chapters: splitChapters,
+        new_title: $('newTitle').value.trim() || null,
+        embed_chapters: !clipEnabled && !audioOnly,
         no_mtime: true,
         media_title: info.title || null,
         extractor: info.extractor || null
@@ -178,6 +202,27 @@ function renderInfo(info, url) {
     finally { button.disabled = false; }
   };
   $('copyTitle').onclick = () => navigator.clipboard?.writeText(info.title || '').then(() => toast('تم نسخ العنوان'));
+  $('formatSelect').addEventListener('change', () => {
+    const selectedId = $('formatSelect').value;
+    const selectedFormat = formats.find(format => format.format_id === selectedId);
+    // The Android FormatPage clears separate audio tracks when a muxed
+    // video+audio format or the suggested format is selected.
+    if (selectedId === '__suggested__' || (selectedFormat && selectedFormat.acodec && selectedFormat.acodec !== 'none')) {
+      $('audioStreamSelect').value = '';
+    }
+  });
+  const clipToggle = $('clipEnabled');
+  const splitToggle = $('splitChapters');
+  if (clipToggle) clipToggle.addEventListener('change', () => {
+    $('clipFields').classList.toggle('hidden', !clipToggle.checked);
+    if (clipToggle.checked && splitToggle) splitToggle.checked = false;
+  });
+  if (splitToggle) splitToggle.addEventListener('change', () => {
+    if (splitToggle.checked && clipToggle) {
+      clipToggle.checked = false;
+      $('clipFields')?.classList.add('hidden');
+    }
+  });
 }
 
 async function monitorJob(jobId, startButton) {

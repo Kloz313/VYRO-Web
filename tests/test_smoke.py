@@ -56,30 +56,25 @@ def test_job_detail_can_read_persisted_job():
     assert response.json()["status"] == "completed"
 
 
-def test_basic_auth_gate_when_enabled(monkeypatch):
-    import base64
-    import backend.main as main
-    monkeypatch.setattr(main, "REQUIRE_AUTH", True)
-    monkeypatch.setattr(main, "ACCESS_USERNAME", "tester")
-    monkeypatch.setattr(main, "ACCESS_PASSWORD", "strong-test-password")
-    denied = client.get("/")
-    assert denied.status_code == 401
-    token = base64.b64encode(b"tester:strong-test-password").decode()
-    allowed = client.get("/", headers={"Authorization": f"Basic {token}"})
-    assert allowed.status_code == 200
-    monkeypatch.setattr(main, "REQUIRE_AUTH", False)
+def test_public_service_has_no_visitor_basic_auth_gate():
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "VYRO" in response.text
 
 
-def test_download_concurrency_limit(monkeypatch):
+def test_download_requests_are_queued_without_per_user_job_quota(monkeypatch):
     import backend.main as main
-    monkeypatch.setattr(main, "MAX_ACTIVE_JOBS", 1)
+    submitted = []
+    monkeypatch.setattr(main, "submit_download_job", lambda job_id, payload: submitted.append(job_id))
+    first = main.create_download(main.DownloadRequest(url="https://8.8.8.8/media-one"))
+    second = main.create_download(main.DownloadRequest(url="https://8.8.8.8/media-two"))
+    assert first["status"] == second["status"] == "queued"
+    assert len(submitted) == 2
     with main.jobs_lock:
-        main.jobs["active-fixture"] = {"id": "active-fixture", "status": "downloading"}
-    response = client.post("/api/download", json={"url": "https://8.8.8.8/media"})
-    assert response.status_code == 429
-    with main.jobs_lock:
-        main.jobs.pop("active-fixture", None)
-    monkeypatch.setattr(main, "MAX_ACTIVE_JOBS", 2)
+        for job_id in submitted:
+            main.jobs.pop(job_id, None)
+    with main.db() as conn:
+        conn.executemany("DELETE FROM jobs WHERE id=?", [(job_id,) for job_id in submitted])
 
 
 def test_jobs_endpoint_reads_persisted_job_snapshot():
@@ -340,17 +335,11 @@ def test_download_file_supports_safe_subdirectories(tmp_path, monkeypatch):
     assert client.get("/api/files/../vyro-web.sqlite3").status_code in {404, 405}
 
 
-def test_proxy_rejects_private_network_targets():
+def test_advanced_proxy_settings_are_not_exposed_to_visitors():
     import backend.main as main
-    from fastapi import HTTPException
-    try:
-        main.common_options(main.ExtractRequest(
-            url="https://8.8.8.8/media", proxy_url="http://127.0.0.1:8080"
-        ))
-    except HTTPException as exc:
-        assert exc.status_code == 422
-    else:
-        raise AssertionError("private proxy target should be rejected")
+    request = main.ExtractRequest(url="https://8.8.8.8/media", proxy_url="http://127.0.0.1:8080")
+    opts = main.common_options(request)
+    assert "proxy" not in opts
 
 
 def test_subtitle_embedding_and_rate_limit_use_python_api_postprocessors(monkeypatch):
@@ -381,17 +370,18 @@ def test_subtitle_embedding_and_rate_limit_use_python_api_postprocessors(monkeyp
     assert "FFmpegSubtitlesConvertor" in keys
     assert "FFmpegEmbedSubtitle" in keys
     assert "FFmpegVideoRemuxer" in keys
-    assert captured["ratelimit"] == 2 * 1024 * 1024
+    # Rate limiting is an app/network preference, not a visitor-facing control.
+    assert "ratelimit" not in captured
     with main.jobs_lock:
         main.jobs.pop(job_id, None)
 
 
-def test_ipv4_flag_maps_to_python_api_source_address():
+def test_force_ipv4_is_not_a_visitor_facing_option():
     import backend.main as main
     opts = main.common_options(main.ExtractRequest(
         url="https://8.8.8.8/media", force_ipv4=True
     ))
-    assert opts["source_address"] == "0.0.0.0"
+    assert "source_address" not in opts
     assert "force_ipv4" not in opts
 
 
@@ -451,22 +441,24 @@ def test_restart_requeues_jobs_with_safe_persisted_request():
         main.jobs.pop(snapshot["id"], None)
 
 
-def test_cookie_contents_are_not_persisted_with_job_request():
+def test_visitor_cookie_upload_is_not_part_of_the_web_workflow(monkeypatch):
     import backend.main as main
-    response = main.create_download(main.DownloadRequest(
-        url="https://8.8.8.8/cookie-session", cookies_text="# Netscape HTTP Cookie File\nsecret-cookie"
-    ))
+    monkeypatch.setattr(main, "submit_download_job", lambda job_id, payload: None)
+    payload = main.DownloadRequest(
+        url="https://8.8.8.8/cookie-session",
+        cookies_text="# Netscape HTTP Cookie File\nsecret-cookie",
+    )
+    response = main.create_download(payload)
     job_id = response["id"]
     snapshot = main.jobs[job_id]
-    assert snapshot["restart_recoverable"] is False
-    assert "request" not in snapshot
+    assert snapshot["restart_recoverable"] is True
+    assert "request" in snapshot
     assert "secret-cookie" not in str(snapshot)
-    import time
-    deadline = time.time() + 2
-    while time.time() < deadline and main.jobs.get(job_id, {}).get("status") not in {"completed", "failed"}:
-        time.sleep(0.01)
+    assert "cookies_text" not in snapshot["request"]
     with main.jobs_lock:
         main.jobs.pop(job_id, None)
+    with main.db() as conn:
+        conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
 
 
 def test_android_audio_quality_includes_32_kbps_preference(monkeypatch):
@@ -556,3 +548,72 @@ def test_android_video_codec_and_resolution_sort_preferences(monkeypatch):
     assert captured["format_sort"] == ["proto", "vcodec:h264", "ext", "res:2160"]
     with main.jobs_lock:
         main.jobs.pop(job_id, None)
+
+
+def test_clean_info_preserves_requested_formats_chapters_and_metadata():
+    from backend.main import clean_info
+    info = clean_info({
+        "id": "clip-fixture", "title": "Clip source", "duration": 300,
+        "like_count": 17, "comment_count": 3,
+        "requested_formats": [
+            {"format_id": "137", "ext": "mp4", "height": 1080, "vcodec": "avc1", "acodec": "none"},
+            {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a"},
+        ],
+        "chapters": [{"title": "Intro", "start_time": 0, "end_time": 30}],
+    })
+    assert [item["format_id"] for item in info["requested_formats"]] == ["137", "140"]
+    assert info["chapters"][0]["title"] == "Intro"
+    assert info["like_count"] == 17 and info["comment_count"] == 3
+
+
+def test_frontend_exposes_source_format_page_actions():
+    from pathlib import Path
+    source = (Path(__file__).resolve().parents[1] / "frontend" / "app.js").read_text(encoding="utf-8")
+    for required in ("__suggested__", "clipEnabled", "splitChapters", "newTitle", "download_sections", "requested_formats"):
+        assert required in source
+
+
+def test_worker_pool_has_bounded_global_parallelism():
+    import backend.main as main
+    assert 1 <= main.executor._max_workers <= 16
+
+
+def test_cleanup_removes_expired_terminal_jobs_but_preserves_active_files(tmp_path):
+    import json, os, time
+    import backend.main as main
+    now = time.time()
+    old_time = now - 7200
+    old_file = main.DOWNLOAD_DIR / "Video" / "old-media.mp4"
+    active_file = main.DOWNLOAD_DIR / "Video" / "active-media.mp4"
+    old_file.parent.mkdir(parents=True, exist_ok=True)
+    old_file.write_bytes(b"old")
+    active_file.write_bytes(b"active")
+    os.utime(old_file, (old_time, old_time))
+    os.utime(active_file, (old_time, old_time))
+
+    old_job = {"id": "expired-job-fixture", "status": "completed", "finished_at": old_time, "files": ["Video/old-media.mp4"]}
+    active_job = {"id": "active-job-fixture", "status": "downloading", "filename": "Video/active-media.mp4"}
+    with main.jobs_lock:
+        main.jobs[old_job["id"]] = old_job
+        main.jobs[active_job["id"]] = active_job
+    with main.db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO jobs(id,status,data,updated_at) VALUES(?,?,?,?)",
+            (old_job["id"], "completed", json.dumps(old_job), old_time),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO jobs(id,status,data,updated_at) VALUES(?,?,?,?)",
+            (active_job["id"], "downloading", json.dumps(active_job), now),
+        )
+
+    main.cleanup_expired_data(now=now, retention_seconds=3600)
+    assert old_job["id"] not in main.jobs
+    assert active_job["id"] in main.jobs
+    assert not old_file.exists()
+    assert active_file.exists()
+    with main.db() as conn:
+        assert conn.execute("SELECT 1 FROM jobs WHERE id=?", (old_job["id"],)).fetchone() is None
+        conn.execute("DELETE FROM jobs WHERE id=?", (active_job["id"],))
+    with main.jobs_lock:
+        main.jobs.pop(active_job["id"], None)
+    active_file.unlink(missing_ok=True)
