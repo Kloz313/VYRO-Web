@@ -315,6 +315,17 @@ def common_options(payload: BaseModel) -> dict[str, Any]:
         # A fixed list can suppress newer/default clients and change format availability.
     }
     host = (urlparse(payload.url).hostname or "").lower().rstrip(".")
+
+    if (
+        host in {"youtube.com", "youtu.be", "youtube-nocookie.com"}
+        or host.endswith((".youtube.com", ".youtu.be"))
+    ):
+        extractor_args = dict(opts.get("extractor_args") or {})
+        youtube_args = dict(extractor_args.get("youtube") or {})
+        youtube_args["player_client"] = ["mweb"]
+        extractor_args["youtube"] = youtube_args
+        opts["extractor_args"] = extractor_args
+
     if host == "tiktok.com" or host.endswith(".tiktok.com"):
         # Keep Chrome impersonation scoped to TikTok and use yt-dlp's typed API.
         from yt_dlp.networking.impersonate import ImpersonateTarget
