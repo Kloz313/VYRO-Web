@@ -27,6 +27,16 @@ class YoutubeDL:
 
 mock.YoutubeDL = YoutubeDL
 mock.__path__ = []
+networking_pkg = types.ModuleType("yt_dlp.networking")
+networking_pkg.__path__ = []
+impersonate_module = types.ModuleType("yt_dlp.networking.impersonate")
+class ImpersonateTarget:
+    @classmethod
+    def from_str(cls, value):
+        return ("impersonate-target", value)
+impersonate_module.ImpersonateTarget = ImpersonateTarget
+sys.modules["yt_dlp.networking"] = networking_pkg
+sys.modules["yt_dlp.networking.impersonate"] = impersonate_module
 postprocessor_pkg = types.ModuleType("yt_dlp.postprocessor")
 postprocessor_pkg.__path__ = []
 metadata_module = types.ModuleType("yt_dlp.postprocessor.metadataparser")

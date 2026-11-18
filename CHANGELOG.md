@@ -71,3 +71,13 @@
 - Updated the web dependency from the open-ended `2026.10.26` minimum to the exact Android-reported nightly build `2026.11.17.232707` (PyPI prerelease identifier `2026.11.17.232707.dev0`).
 - This nightly contains YouTube extractor fixes for web_embedded client policies and post-live stream handling.
 - A clean package installation, Docker image build, Railway deployment and live platform downloads are still pending; mocked tests do not prove extractor success.
+
+
+## 2026-11-18 — YouTube extraction stability and diagnostics
+- Bounded metadata extraction concurrency independently from download workers.
+- Added limited exponential retries for transient network, HTTP 5xx and 429 failures; login/bot challenges, 403 and unsupported URLs are not retried.
+- Added safe per-request extraction and download lifecycle logs with correlation IDs, engine version, sanitized error summaries and provider/client diagnostics.
+- Exposed BGUtil readiness and extraction limits through `/api/health`.
+- Kept yt-dlp pinned version and automatic YouTube player-client selection unchanged.
+- Kept typed Chrome impersonation scoped to TikTok only.
+- Validation: 46 automated tests passed; no live platform test, Docker build or Railway deployment was performed.

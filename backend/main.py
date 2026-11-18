@@ -4,6 +4,7 @@ import asyncio
 import ipaddress
 import importlib.metadata
 import json
+import logging
 import os
 import sqlite3
 import re
@@ -25,7 +26,6 @@ from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import yt_dlp
-from yt_dlp.networking.impersonate import ImpersonateTarget
 
 ROOT = Path(__file__).resolve().parent.parent
 FRONTEND = ROOT / "frontend"
@@ -37,6 +37,23 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "vyro-web.sqlite3"
 FILE_RETENTION_HOURS = max(1, min(int(os.getenv("VYRO_FILE_RETENTION_HOURS", "24")), 168))
 FILE_RETENTION_SECONDS = FILE_RETENTION_HOURS * 60 * 60
+
+
+def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+# Extraction is independent from the download worker pool. Keep it bounded so
+# concurrent browser requests do not create a burst of YouTube player requests.
+EXTRACT_MAX_CONCURRENT = _bounded_int_env("VYRO_EXTRACT_WORKERS", 2, 1, 8)
+EXTRACT_MAX_ATTEMPTS = _bounded_int_env("VYRO_EXTRACT_ATTEMPTS", 2, 1, 3)
+EXTRACT_RETRY_BASE_SECONDS = 1.5
+extract_semaphore = threading.BoundedSemaphore(EXTRACT_MAX_CONCURRENT)
+extract_logger = logging.getLogger("mediaweb.extract")
 
 @contextmanager
 def db():
@@ -299,6 +316,8 @@ def common_options(payload: BaseModel) -> dict[str, Any]:
     }
     host = (urlparse(payload.url).hostname or "").lower().rstrip(".")
     if host == "tiktok.com" or host.endswith(".tiktok.com"):
+        # Keep Chrome impersonation scoped to TikTok and use yt-dlp's typed API.
+        from yt_dlp.networking.impersonate import ImpersonateTarget
         opts["impersonate"] = ImpersonateTarget.from_str("chrome")
     return opts
 
@@ -394,19 +413,115 @@ def health():
             "aria2c": shutil.which("aria2c") is not None,
             "node": shutil.which("node") is not None,
             "youtube_pot_provider": youtube_pot_provider,
-            "youtube_pot_plugin": youtube_pot_plugin}
+            "youtube_pot_plugin": youtube_pot_plugin,
+            "youtube_pot_ready": youtube_pot_provider and youtube_pot_plugin,
+            "extract_concurrency": EXTRACT_MAX_CONCURRENT,
+            "extract_attempts": EXTRACT_MAX_ATTEMPTS}
+
+
+def _platform_for_url(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    if host == "youtube.com" or host.endswith(".youtube.com") or host in {"youtu.be", "youtube-nocookie.com"}:
+        return "youtube"
+    if host == "tiktok.com" or host.endswith(".tiktok.com"):
+        return "tiktok"
+    return host[:80] or "unknown"
+
+
+def _is_transient_extractor_error(error: Exception | str) -> bool:
+    """Retry only transport/server throttling failures, never platform challenges."""
+    message = str(error).lower()
+    permanent_markers = (
+        "sign in to confirm", "login_required", "confirm you're not a bot",
+        "http error 403", "http 403", "403 forbidden", "unsupported url",
+        "no suitable extractor", "private video", "video unavailable",
+    )
+    if any(marker in message for marker in permanent_markers):
+        return False
+    transient_markers = (
+        "http error 429", "http 429", "too many requests",
+        "http error 500", "http error 502", "http error 503", "http error 504",
+        "http 500", "http 502", "http 503", "http 504",
+        "timed out", "timeout", "connection reset", "connection aborted",
+        "remote end closed", "temporary failure in name resolution",
+        "name or service not known", "network is unreachable", "unexpected eof",
+        "ssl: eof", "server disconnected", "incomplete read",
+    )
+    return any(marker in message for marker in transient_markers)
+
+
+def _safe_error_summary(error: Exception | str) -> str:
+    """Keep useful extractor wording while removing URLs and credential-like values."""
+    message = str(error)
+    message = re.sub(r"https?://[^\s\"'<>]+", "[URL]", message, flags=re.IGNORECASE)
+    message = re.sub(
+        r"(?i)(po[_-]?token|visitor[_-]?data|authorization|cookie|signature|sig)=([^&\s]+)",
+        r"\1=[REDACTED]", message,
+    )
+    return re.sub(r"\s+", " ", message).strip()[:240]
+
+
+def _retry_delay_seconds(error: Exception | str, attempt: int) -> float:
+    message = str(error).lower()
+    if "429" in message or "too many requests" in message:
+        return min(5.0 * (2 ** (attempt - 1)), 15.0)
+    return min(EXTRACT_RETRY_BASE_SECONDS * (2 ** (attempt - 1)), 6.0)
+
+
+def _extract_info_with_retries(url: str, opts: dict[str, Any], diagnostics: YtDlpDiagnostics,
+                               request_id: str, platform: str) -> dict[str, Any] | None:
+    """Bound concurrency and retry only transient transport/throttling failures."""
+    started = time.monotonic()
+    with extract_semaphore:
+        for attempt in range(1, EXTRACT_MAX_ATTEMPTS + 1):
+            try:
+                extract_logger.info(
+                    "extract_attempt_start request_id=%s platform=%s attempt=%s/%s engine=%s",
+                    request_id, platform, attempt, EXTRACT_MAX_ATTEMPTS, yt_dlp.version.__version__,
+                )
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                if not info:
+                    raise RuntimeError("لم يتم العثور على معلومات للوسائط")
+                extract_logger.info(
+                    "extract_success request_id=%s platform=%s attempt=%s duration_ms=%s diagnostics=%s",
+                    request_id, platform, attempt, int((time.monotonic() - started) * 1000),
+                    json.dumps(diagnostics.events[:8], ensure_ascii=False),
+                )
+                return info
+            except Exception as exc:
+                retryable = _is_transient_extractor_error(exc)
+                if retryable and attempt < EXTRACT_MAX_ATTEMPTS:
+                    delay = _retry_delay_seconds(exc, attempt)
+                    extract_logger.warning(
+                        "extract_retry request_id=%s platform=%s attempt=%s/%s error_type=%s error_summary=%s wait_seconds=%.1f diagnostics=%s",
+                        request_id, platform, attempt, EXTRACT_MAX_ATTEMPTS, type(exc).__name__,
+                        _safe_error_summary(exc), delay,
+                        json.dumps(diagnostics.events[:8], ensure_ascii=False),
+                    )
+                    time.sleep(delay)
+                    continue
+                extract_logger.error(
+                    "extract_failed request_id=%s platform=%s attempts=%s duration_ms=%s error_type=%s error_summary=%s retryable=%s diagnostics=%s",
+                    request_id, platform, attempt, int((time.monotonic() - started) * 1000),
+                    type(exc).__name__, _safe_error_summary(exc), retryable,
+                    json.dumps(diagnostics.events[:8], ensure_ascii=False),
+                )
+                raise
+    return None
 
 
 @app.post("/api/extract")
 def extract(payload: ExtractRequest):
     url = validate_url(payload.url)
+    request_id = uuid.uuid4().hex[:12]
+    platform = _platform_for_url(url)
     diagnostics = YtDlpDiagnostics()
     opts = common_options(payload)
     opts.update({"skip_download": True, "extract_flat": "in_playlist" if payload.include_playlist else False,
                  "logger": diagnostics, "verbose": True})
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info = _extract_info_with_retries(url, opts, diagnostics, request_id, platform)
         if not info:
             raise HTTPException(status_code=422, detail="لم يتم العثور على معلومات للوسائط")
         return clean_info(info)
@@ -673,6 +788,11 @@ def run_download(job_id: str, payload: DownloadRequest) -> None:
         if not completed_paths:
             completed_paths.extend(progress_finished_paths)
         completed_paths = list(dict.fromkeys(completed_paths))
+        extract_logger.info(
+            "download_success job_id=%s platform=%s engine=%s file_count=%s diagnostics=%s",
+            job_id, _platform_for_url(url), yt_dlp.version.__version__, len(completed_paths),
+            json.dumps(diagnostics.events[:8], ensure_ascii=False),
+        )
         with jobs_lock:
             completion_update = {"status": "completed", "percent": 100, "finished_at": time.time(),
                                  "files": completed_paths}
@@ -690,6 +810,11 @@ def run_download(job_id: str, payload: DownloadRequest) -> None:
             jobs[job_id].update({"status": "cancelled", "error": str(exc), "finished_at": time.time()})
         persist_job(job_id)
     except Exception as exc:
+        extract_logger.error(
+            "download_failed job_id=%s platform=%s engine=%s error_type=%s diagnostics=%s",
+            job_id, _platform_for_url(url), yt_dlp.version.__version__, type(exc).__name__,
+            json.dumps(diagnostics.events[:8], ensure_ascii=False) if "diagnostics" in locals() else "[]",
+        )
         with jobs_lock:
             if cancel_event.is_set():
                 jobs[job_id].update({"status": "cancelled", "error": "ألغى المستخدم مهمة التنزيل", "finished_at": time.time()})
